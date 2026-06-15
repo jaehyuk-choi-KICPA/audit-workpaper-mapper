@@ -1,0 +1,21 @@
+# 비공개 폴더 (데이터·양식)
+_internal/
+
+# 환경변수·키
+.env
+*.key
+
+# 엑셀 파일 이중 차단
+*.xlsx
+*.xls
+
+# Python 찌꺼기
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
