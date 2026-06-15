@@ -1,0 +1,146 @@
+"""금융기관조회서 취합엑셀 INSURANCE 시트 파서.
+
+보험사 회신 1번 항목(보험거래 내용)에서 **해약환급금이 있는 적립식 보험**만
+장기금융상품으로 추출한다. (해약환급금 0인 손해·차량보험 등은 제외)
+
+분류·그룹화 규칙 (실파일 검증):
+  - 해약환급금_금액(col29) > 0 → 장기금융상품
+  - (금융기관명, 보험의종류) 동일한 정책을 1행으로 묶음
+    · 증권번호: 쉼표 연결
+    · 조회서금액: 해약환급금_금액 합산
+
+⚠️ INSURANCE 시트는 6개 섹션(1.보험 2.대출 3.지급보증 …)으로 구성되며
+   1번 섹션만 사용한다. col29에는 ''(빈문자열)·None이 섞여 있으므로
+   금액 변환은 반드시 안전 변환(_to_amount)을 거친다. (int('') 크래시 방지)
+"""
+
+import re
+from pathlib import Path
+
+import openpyxl
+
+from ._sections import find_section_bounds
+
+# 헤더 동의어 → 표준 컬럼명.
+# 주의: '해약환급금'(col15 텍스트)은 매핑하지 않는다. 숫자열인
+#       '해약환급금_금액'(col29)만 사용한다.
+_SYNONYMS: dict[str, str] = {
+    "금융기관명":   "금융기관명",
+    "보험의 종류":  "보험의종류",
+    "보험의종류":   "보험의종류",
+    "증권번호":     "증권번호",
+    "해약환급금_금액": "해약환급금",
+}
+
+_REQUIRED = {"금융기관명", "보험의종류", "해약환급금"}
+
+_DEFAULT_SHEET = "INSURANCE"
+
+
+def _map_headers(row: tuple) -> dict[str, int]:
+    """행에서 {표준컬럼명: 열인덱스} 매핑. 필수 컬럼 없으면 빈 dict."""
+    mapping: dict[str, int] = {}
+    for idx, cell in enumerate(row):
+        if cell is None:
+            continue
+        std = _SYNONYMS.get(str(cell).strip())
+        if std and std not in mapping:
+            mapping[std] = idx
+    return mapping if _REQUIRED.issubset(mapping.keys()) else {}
+
+
+def _to_amount(value) -> float:
+    """금액 셀을 안전하게 숫자로 변환. None/''/비숫자 → 0 (절대 예외 없음)."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        s = re.sub(r"[^\d.\-]", "", value)  # 'KRW 1,234' → '1234'
+        try:
+            return float(s) if s else 0
+        except ValueError:
+            return 0
+    return 0
+
+
+def parse_insurance(path: str, sheet_name: str = _DEFAULT_SHEET) -> list[dict]:
+    """INSURANCE 1번 섹션에서 장기금융상품(해약환급금 보유)을 추출·그룹화한다.
+
+    Returns:
+        [{"금융기관명", "보험의종류", "증권번호", "조회서금액", "건수"}, ...]
+        (금융기관명, 보험의종류) 기준 그룹. 조회서금액 = 해약환급금 합산.
+
+    Raises:
+        ValueError: 시트 없음 / 1번 섹션·헤더 미발견
+    """
+    p = Path(path)
+    wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"[INSURANCE 파서] 시트 '{sheet_name}' 없음. 존재: {wb.sheetnames}")
+
+    rows = list(wb[sheet_name].iter_rows(values_only=True))
+    wb.close()
+
+    bounds = find_section_bounds(rows, "1.")
+    if bounds is None:
+        raise ValueError("[INSURANCE 파서] 1번 섹션(보험거래) 마커를 찾을 수 없습니다.")
+    sec_idx, sec_end = bounds
+
+    header_idx, col_map = None, None
+    for i in range(sec_idx + 1, min(sec_idx + 6, sec_end)):
+        cm = _map_headers(rows[i])
+        if cm:
+            header_idx, col_map = i, cm
+            break
+    if col_map is None:
+        raise ValueError("[INSURANCE 파서] 1번 섹션 헤더를 찾을 수 없습니다.")
+
+    c_inst = col_map["금융기관명"]
+    c_kind = col_map["보험의종류"]
+    c_amt = col_map["해약환급금"]
+    c_pol = col_map.get("증권번호")
+
+    def g(row, idx):
+        return row[idx] if idx is not None and idx < len(row) else None
+
+    # (금융기관명, 보험의종류) → 그룹 누적 (등장 순서 유지)
+    groups: dict[tuple, dict] = {}
+    for i in range(header_idx + 1, sec_end):
+        row = rows[i]
+        inst = g(row, c_inst)
+        if inst is None or str(inst).strip() == "":
+            continue
+
+        amount = _to_amount(g(row, c_amt))
+        if amount <= 0:
+            continue  # 해약환급금 없는 보험(손해·차량 등) → 장기금융상품 아님
+
+        kind = g(row, c_kind)
+        key = (str(inst).strip(), str(kind).strip() if kind else "")
+        policy = g(row, c_pol)
+
+        if key not in groups:
+            groups[key] = {
+                "금융기관명": key[0],
+                "보험의종류": key[1],
+                "증권번호목록": [],
+                "조회서금액": 0,
+                "건수": 0,
+            }
+        grp = groups[key]
+        grp["조회서금액"] += amount
+        grp["건수"] += 1
+        if policy is not None and str(policy).strip() not in ("", "' "):
+            grp["증권번호목록"].append(str(policy).strip())
+
+    result = []
+    for grp in groups.values():
+        result.append({
+            "금융기관명": grp["금융기관명"],
+            "보험의종류": grp["보험의종류"],
+            "증권번호":   ", ".join(grp["증권번호목록"]),
+            "조회서금액": grp["조회서금액"],
+            "건수":       grp["건수"],
+        })
+    return result

@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#
+# pre-commit — 공개 저장소 데이터 보호 게이트
+#
+# 스테이징된(=커밋될) 파일만 검사한다. 다음을 발견하면 커밋을 차단한다.
+#   1) 경로 차단: _internal/ 하위, 엑셀(.xlsx/.xls/.xlsm), 비밀(.env/*.key/*.pem)
+#   2) 내용 차단: 사업자등록번호·주민등록번호 패턴
+#   3) 회사명 차단: _internal/security/denylist.txt 의 키워드 (비공개 목록)
+#
+# 회사명 목록을 훅 파일에 넣으면 그 자체가 유출이므로, 목록은 gitignore된
+# _internal/security/denylist.txt 에서 읽는다. 목록이 없으면 경고만 한다.
+#
+# 의도적 우회(책임 하): git commit --no-verify
+
+set -u
+
+RED='\033[31m'; YEL='\033[33m'; NC='\033[0m'
+red()  { printf "${RED}%s${NC}\n"  "$1"; }
+yel()  { printf "${YEL}%s${NC}\n"  "$1"; }
+
+fail=0
+DENYLIST="_internal/security/denylist.txt"
+
+# 사업자등록번호(NNN-NN-NNNNN) / 주민등록번호(NNNNNN-NNNNNNN)
+BIZ_RE='[0-9]{3}-[0-9]{2}-[0-9]{5}'
+RRN_RE='[0-9]{6}-[0-9]{7}'
+
+# denylist → 정규식 (빈줄·주석 제외, '|' 결합)
+NAMES_RE=""
+if [ -f "$DENYLIST" ]; then
+  NAMES_RE=$(grep -vE '^[[:space:]]*(#|$)' "$DENYLIST" | paste -sd'|' -)
+else
+  yel "경고: $DENYLIST 없음 — 회사명 검사를 건너뜁니다(권장: 생성)."
+fi
+
+# 스테이징된 파일(추가/수정/복사/이름변경), NUL 구분으로 안전 처리
+while IFS= read -r -d '' f; do
+  # --- 1) 경로 차단 ---
+  case "$f" in
+    _internal/*|*/_internal/*)
+      red "차단[경로]: 비공개 _internal 경로가 스테이징됨 → $f"; fail=1; continue ;;
+    *.xlsx|*.xls|*.xlsm)
+      red "차단[경로]: 엑셀 데이터 파일이 스테이징됨 → $f"; fail=1; continue ;;
+    .env|*.key|*.pem)
+      red "차단[경로]: 비밀/키 파일이 스테이징됨 → $f"; fail=1; continue ;;
+  esac
+
+  # 인덱스(스테이징)에 있는 실제 내용만 검사
+  content=$(git show ":$f" 2>/dev/null) || continue
+  # 바이너리면 건너뜀
+  printf '%s' "$content" | grep -qI . 2>/dev/null || continue
+
+  # --- 2) 내용 차단: 식별번호 ---
+  if printf '%s' "$content" | grep -Eq "$BIZ_RE"; then
+    red "차단[내용]: 사업자등록번호 형태 발견 → $f"; fail=1
+  fi
+  if printf '%s' "$content" | grep -Eq "$RRN_RE"; then
+    red "차단[내용]: 주민등록번호 형태 발견 → $f"; fail=1
+  fi
+
+  # --- 3) 내용 차단: 회사명/비공개 키워드 ---
+  if [ -n "$NAMES_RE" ] && printf '%s' "$content" | grep -Eiq "$NAMES_RE"; then
+    hits=$(printf '%s' "$content" | grep -Eio "$NAMES_RE" | sort -u | paste -sd', ' -)
+    red "차단[내용]: 비공개 키워드 발견($hits) → $f"; fail=1
+  fi
+done < <(git diff --cached --name-only -z --diff-filter=ACMR)
+
+if [ "$fail" -ne 0 ]; then
+  echo
+  red "==== 커밋 차단: 비공개 데이터(회사명·실데이터·양식) 유입 위험 ===="
+  yel "해당 내용을 제거한 뒤 다시 커밋하세요."
+  exit 1
+fi
+exit 0
