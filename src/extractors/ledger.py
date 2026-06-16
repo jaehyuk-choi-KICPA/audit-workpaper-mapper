@@ -10,7 +10,8 @@
                  헤더: 코드|거래처명|전기(월)이월|차변|대변|잔액   (데이터 col2~)
 
 출력 이상적 헤더:
-  계정과목 | 코드 | 거래처명 | 전기이월 | 차변/증가 | 대변/감소 | 잔액
+  계정과목 | 적요 | 거래처명 | 전기이월 | 차변/증가 | 대변/감소 | 잔액 | 비고
+  (거래처원장은 적요·비고가 없어 공란. 결산보고서 변환 시 적요·비고가 채워짐)
 
 ★ 계정과목 결정 원칙 (절대 규칙)
   계정과목은 **오직 시트명에서만** 도출한다. 원본 ERP 출력은 계정별로 시트가
@@ -36,9 +37,7 @@ except ImportError:
 # 헤더 동의어 → 표준 컬럼명
 # ---------------------------------------------------------------------------
 
-def _normalize(s) -> str:
-    """컬럼명 정규화: 내부 공백 제거 + strip. '거 래 처 명' → '거래처명'."""
-    return re.sub(r"\s+", "", str(s).strip()) if s is not None else ""
+from ._headers import normalize as _normalize, map_headers
 
 
 _SYNONYMS: dict[str, str] = {
@@ -56,6 +55,18 @@ _SYNONYMS: dict[str, str] = {
 # 계정과목은 시트명에서만 도출하므로 동의어에 포함하지 않는다 (의도적).
 
 _REQUIRED = {"코드", "거래처명", "전기이월", "차변/증가", "대변/감소", "잔액"}
+
+# 부분일치(fuzzy) 폴백용 키워드 — 정확매칭으로 못 찾은 필수 컬럼만 보강한다.
+# 헤더 라벨이 ERP마다 조금씩 달라도(예: '기말잔액', '거 래 처', '당기증가') 흡수.
+# 순서 = 구체적(specific) 우선. 정확매칭이 1차이므로 회귀 위험은 없다(폴백 전용).
+_SUB_KEYWORDS: list[tuple] = [
+    ("코드",      ["코드"]),
+    ("거래처명",  ["거래처", "거래처명", "상호", "계좌명", "예금주"]),
+    ("전기이월",  ["전기이월", "기초", "이월"]),
+    ("차변/증가", ["차변", "증가", "입금"]),
+    ("대변/감소", ["대변", "감소", "출금"]),
+    ("잔액",      ["잔액", "기말"]),
+]
 
 _TOTAL_MARKERS = {"합계"}  # _normalize 후 비교하므로 '합 계'도 매칭됨
 
@@ -100,15 +111,12 @@ def _account_name(sheet_name: str, fmt: str) -> "str | None":
 # ---------------------------------------------------------------------------
 
 def _try_map_headers(header_row: list) -> "dict[str, int] | None":
-    """헤더 행 시도. 필수 컬럼 미충족이면 None 반환 (예외 없음)."""
-    mapping: dict[str, int] = {}
-    for idx, cell in enumerate(header_row):
-        if cell is None:
-            continue
-        std = _SYNONYMS.get(_normalize(cell))
-        if std and std not in mapping:
-            mapping[std] = idx
-    return mapping if _REQUIRED.issubset(mapping.keys()) else None
+    """헤더 행 시도. 필수 컬럼 미충족이면 None 반환 (예외 없음).
+
+    1차: 정확 동의어 매칭(기존, 검증됨). 2차: 못 찾은 필수 컬럼만 부분일치(fuzzy) 폴백.
+    """
+    return map_headers(header_row, synonyms=_SYNONYMS, required=_REQUIRED,
+                       sub_keywords=_SUB_KEYWORDS, parser_key="ledger")
 
 
 # ---------------------------------------------------------------------------
@@ -132,14 +140,17 @@ def _to_record(row: list, account: str, col_map: dict[str, int]) -> dict:
         idx = col_map.get(col)
         return row[idx] if idx is not None and idx < len(row) else None
 
+    # 코드는 데이터 행 탐색용으로만 읽고 출력 헤더에는 포함하지 않는다.
+    # 거래처원장에는 적요·비고가 없으므로 공란으로 둔다(결산보고서에서만 채워짐).
     return {
         "계정과목":  account,
-        "코드":      g("코드"),
+        "적요":      None,
         "거래처명":  g("거래처명"),
         "전기이월":  g("전기이월"),
         "차변/증가": g("차변/증가"),
         "대변/감소": g("대변/감소"),
         "잔액":      g("잔액"),
+        "비고":      None,
     }
 
 
@@ -288,17 +299,17 @@ def parse_ledger(path: str) -> list[dict]:
 #   (수기 편집 산물이 아니므로, 표준 파일을 읽을 때는 행별 계정과목 컬럼을 신뢰한다)
 # ---------------------------------------------------------------------------
 
-_IDEAL_HEADER = ["계정과목", "코드", "거래처명", "전기이월", "차변/증가", "대변/감소", "잔액"]
+_IDEAL_HEADER = ["계정과목", "적요", "거래처명", "전기이월", "차변/증가", "대변/감소", "잔액", "비고"]
 
 _DEFAULT_IDEAL_SHEET = "거래처원장"
 
 
 def write_ideal_ledger(rows: list[dict], output_path: str,
                        sheet_title: str = _DEFAULT_IDEAL_SHEET) -> Path:
-    """parse_ledger 결과를 단일 시트 '이상적 양식' 엑셀로 생성한다.
+    """parse_ledger / parse_settlement_report 결과를 단일 시트 '이상적 양식'으로 생성한다.
 
-    헤더: 계정과목 | 코드 | 거래처명 | 전기이월 | 차변/증가 | 대변/감소 | 잔액
-    계정과목은 시트명에서 도출된 정확한 값이다 (수기 편집 산물 아님).
+    헤더: 계정과목 | 적요 | 거래처명 | 전기이월 | 차변/증가 | 대변/감소 | 잔액 | 비고
+    계정과목은 시트명(원장) 또는 과목 컬럼(결산보고서)에서 도출된 값이다.
     """
     from openpyxl import Workbook
 

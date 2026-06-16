@@ -148,3 +148,109 @@ def parse_bank(path: str, sheet_name: str = _DEFAULT_SHEET) -> list[dict]:
         raise ValueError(f"[BANK 파서] 1번 섹션 데이터 행 없음: {path}")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# 2-2번(대출거래) · 9번(담보제공) 섹션 파서 — A-300용
+#
+# 금액은 검은색 텍스트열이 아니라 파란색 숫자열('_금액' 접미)을 사용한다.
+# "해당 없음"·"담보보증내역없음" 등 실거래 없는 행은 제외한다.
+# ---------------------------------------------------------------------------
+
+_LOAN_SYNONYMS = {
+    "조서번호":            "조서번호",
+    "금융기관명":          "금융기관명",
+    "대출 종류":           "대출종류",
+    "대출종류":            "대출종류",
+    "금액_약정한도액_금액": "약정한도액",
+    "금액_대출금액_금액":   "대출금액",
+    "대출일":              "대출일",
+    "최종만기일":          "최종만기일",
+    "이자_연이율":         "연이율",
+    "이자_최종이자지급일":  "최종이자지급일",
+    "상환방법":            "상환방법",
+    "담보 보증 및 관련약정": "담보보증",
+}
+_LOAN_REQUIRED = {"금융기관명", "대출종류", "약정한도액", "대출금액"}
+
+_COLLATERAL_SYNONYMS = {
+    "조서번호":          "조서번호",
+    "금융기관명":        "금융기관명",
+    "구분":              "구분",
+    "담보보증의 내용":   "담보보증내용",
+    "소유자(제공자)":    "소유자",
+    "감정금액_금액":     "감정금액",
+    "설정금액_금액":     "설정금액",
+    "설정순위":          "설정순위",
+    "선순위 설정금액_금액": "선순위설정금액",
+}
+_COLLATERAL_REQUIRED = {"금융기관명", "구분", "감정금액", "설정금액"}
+
+_NONE_TOKENS = {"", "' ", "해당 없음", "해당없음", "담보보증내역없음"}
+
+
+def _map_by(row: tuple, synonyms: dict, required: set) -> dict:
+    mapping = {}
+    for idx, cell in enumerate(row):
+        if cell is None:
+            continue
+        std = synonyms.get(str(cell).strip())
+        if std and std not in mapping:
+            mapping[std] = idx
+    return mapping if required.issubset(mapping.keys()) else {}
+
+
+def _section_rows(path, sheet_name, prefix, synonyms, required):
+    p = Path(path)
+    wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
+    if sheet_name not in wb.sheetnames:
+        wb.close()
+        raise ValueError(f"[BANK 파서] 시트 '{sheet_name}' 없음")
+    rows = list(wb[sheet_name].iter_rows(values_only=True))
+    wb.close()
+
+    bounds = find_section_bounds(rows, prefix)
+    if bounds is None:
+        return []
+    sec_idx, sec_end = bounds
+
+    header_idx, col_map = None, None
+    for i in range(sec_idx + 1, min(sec_idx + 6, sec_end)):
+        cm = _map_by(rows[i], synonyms, required)
+        if cm:
+            header_idx, col_map = i, cm
+            break
+    if col_map is None:
+        return []
+
+    def g(row, key):
+        idx = col_map.get(key)
+        return row[idx] if idx is not None and idx < len(row) else None
+
+    out = []
+    for i in range(header_idx + 1, sec_end):
+        row = rows[i]
+        inst = g(row, "금융기관명")
+        if inst is None or str(inst).strip() == "":
+            continue
+        out.append({k: g(row, k) for k in col_map})
+    return out
+
+
+def _is_none_token(v) -> bool:
+    return v is None or str(v).strip() in _NONE_TOKENS
+
+
+def parse_bank_loans(path: str, sheet_name: str = _DEFAULT_SHEET) -> list[dict]:
+    """BANK 2-2번(대출거래) — 실대출만. 금액은 파란 숫자열 사용."""
+    rows = _section_rows(path, sheet_name, "2-2", _LOAN_SYNONYMS, _LOAN_REQUIRED)
+    return [r for r in rows if not _is_none_token(r.get("대출종류"))]
+
+
+def parse_bank_collateral(path: str, sheet_name: str = _DEFAULT_SHEET) -> list[dict]:
+    """BANK 9번(담보제공) — 실제 담보만(감정/설정금액>0). 금액은 파란 숫자열 사용."""
+    rows = _section_rows(path, sheet_name, "9.", _COLLATERAL_SYNONYMS, _COLLATERAL_REQUIRED)
+    def has_collateral(r):
+        from .insurance import _to_amount as _amt
+        return _amt(r.get("감정금액")) > 0 or _amt(r.get("설정금액")) > 0
+    return [r for r in rows if has_collateral(r)]
