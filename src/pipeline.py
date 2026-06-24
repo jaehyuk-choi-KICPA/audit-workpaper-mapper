@@ -13,7 +13,7 @@ import shutil
 import warnings
 from pathlib import Path
 
-from cache import cached_ideal_ledger
+from cache import cached_ideal_ledger, load_with_cache
 from extractors import (
     parse_cs,
     parse_bank, parse_bank_loans, parse_bank_collateral,
@@ -123,15 +123,21 @@ def build_a1(*, control_sheet, ledger_src, confirm_xlsx, template, config_dir,
             report.add("입력", "error", f"{label} 처리 실패({type(e).__name__}: {e}) → 해당 부분 비움")
             return [] if default is None else default
 
+    # 소스 파일 해시 기반 파싱 캐시(변환자료에 저장 → 동일 입력 재실행 시 재파싱 생략).
+    # 취합엑셀 하나를 6개 파서가 읽으므로 tag로 키 충돌을 막는다. 거래처원장은
+    # cached_ideal_ledger가 이미 변환자료에 캐시하므로 여기서는 confirm/CS만 캐시.
+    def _cached(parse_fn, src, tag):
+        return load_with_cache(src, parse_fn, cache_dir=parsed, tag=tag)
+
     # ---- STEP 1. 데이터 추출 (전부 안전 래핑) ----
-    cs_rows = _safe_parse("발송 Control Sheet", parse_cs, control_sheet)
+    cs_rows = _safe_parse("발송 Control Sheet", _cached, parse_cs, control_sheet, "cs")
     ledger_rows = _safe_parse("거래처원장/결산보고서", cached_ideal_ledger, ledger_src, parsed, str(cfg))
-    bank_rows = _safe_parse("BANK(현금성/퇴직)", parse_bank, confirm_xlsx)
-    ins_groups = _safe_parse("INSURANCE(장기금융)", parse_insurance, confirm_xlsx)
-    invest_rows = _safe_parse("INVESTMENT(단기금융)", parse_invest, confirm_xlsx)
-    loan_rows = _safe_parse("대출(BANK 2-2)", parse_bank_loans, confirm_xlsx)
-    coll_rows = _safe_parse("담보(BANK 9)", parse_bank_collateral, confirm_xlsx)
-    ref_map = _safe_parse("취합 요약(조서번호)", build_ref_map, confirm_xlsx, default={})
+    bank_rows = _safe_parse("BANK(현금성/퇴직)", _cached, parse_bank, confirm_xlsx, "bank")
+    ins_groups = _safe_parse("INSURANCE(장기금융)", _cached, parse_insurance, confirm_xlsx, "insurance")
+    invest_rows = _safe_parse("INVESTMENT(단기금융)", _cached, parse_invest, confirm_xlsx, "invest")
+    loan_rows = _safe_parse("대출(BANK 2-2)", _cached, parse_bank_loans, confirm_xlsx, "loans")
+    coll_rows = _safe_parse("담보(BANK 9)", _cached, parse_bank_collateral, confirm_xlsx, "collateral")
+    ref_map = _safe_parse("취합 요약(조서번호)", _cached, build_ref_map, confirm_xlsx, "refmap", default={})
 
     # 외화 환율 메모(참고자료) 로드 — 없으면 빈 dict(=환산 비활성, KRW 그대로)
     fx_rates = {}
@@ -219,3 +225,263 @@ def _check_form_integrity(path, *, n_cs: int, config_dir: str) -> list:
     if outside_a2:
         out += check_outside_col_fill(path, a2["sheet"], outside_gray_cols=outside_a2)
     return out
+
+
+def build_a0(*, settlement, template, config_dir, output, params=None, parsed_dir=None,
+             config_file="a0.yaml"):
+    """A-0 총괄표(본문 + 수정사항)를 생성한다.
+
+    정산표(별도정산표·수정사항집계)를 단일 소스로 총괄표 본문(기초/기말/수정사항/수정후)과
+    '4.수정사항' 분개표를 채운다. 나머지 섹션은 손대지 않는다(감사인/후속).
+
+    Args:
+        settlement: 정산표 파일 경로(별도정산표·수정사항집계 시트 포함)
+        template:   A-0 작업용 템플릿(.xlsx, '4000_A000 총괄표' 시트)
+        config_dir: 셀 매핑 YAML 디렉터리(a0.yaml)
+        output:     결과 파일 경로
+        params:     공통 헤더(선택; 현재 본문/수정사항만 채우므로 미사용 가능)
+        parsed_dir: 변환자료 폴더(파싱 해시캐시; None이면 출력 폴더 옆)
+
+    Returns:
+        RunReport (부분 실패 허용 — 항상 출력 파일 생성).
+    """
+    from extractors import parse_trial_balance, parse_adjustments
+    from generators import A0Generator
+
+    cfg = Path(config_dir)
+    out = Path(output)
+    parsed = parsed_dir or str(out.parent / "변환자료")
+    report = RunReport()
+
+    # 캐시 태그에 파서 버전을 포함 → 파서 코드가 바뀌면 캐시가 자동 무효화(소스 해시만으론 못 잡음).
+    _PARSER_VER = "v2"
+
+    def _cached(fn, src, tag):
+        return load_with_cache(src, fn, cache_dir=parsed, tag=f"{tag}_{_PARSER_VER}")
+
+    # ---- STEP 1. 정산표 추출 (안전 래핑 + 해시캐시) ----
+    try:
+        tb_rows = _cached(parse_trial_balance, settlement, "trial_balance")
+        report.add("입력", "ok" if tb_rows else "warn",
+                   f"별도정산표: {len(tb_rows)}행" + ("" if tb_rows else " (빈 값 — 헤더 미인식?)"))
+    except Exception as e:
+        tb_rows = []
+        report.add("입력", "error", f"별도정산표 처리 실패({type(e).__name__}: {e})")
+    try:
+        adj = _cached(parse_adjustments, settlement, "adjustments")
+        report.add("입력", "ok" if adj else "warn",
+                   f"수정사항집계: {len(adj)} entries" + ("" if adj else " (없음)"))
+    except Exception as e:
+        adj = []
+        report.add("입력", "error", f"수정사항집계 처리 실패({type(e).__name__}: {e})")
+
+    # ---- STEP 2~3. 생성 ----
+    work = str(out)
+    shutil.copy(template, work)
+    info = {}
+    try:
+        g = A0Generator(work, str(cfg / config_file))
+        info = g.fill(tb_rows, adj, params or {})
+        g.save(work)
+        n_body = info["body_data_end"] - info["body_data_start"] + 1
+        report.add("생성", "ok",
+                   f"총괄표 생성 (본문 {n_body}행, 수정사항 entry {info['n_adj_entries']}건)")
+    except Exception as e:
+        report.add("생성", "error", f"총괄표 생성 실패({type(e).__name__}: {e}) → 양식 기본값")
+
+    # ---- 양식 무결성 HOOK ----
+    if info:
+        try:
+            for issue in _check_a0_form(work, info, str(cfg), config_file, template=template):
+                report.add("출력", "warn", issue)
+        except Exception as e:
+            report.add("출력", "warn", f"양식무결성 검사 자체 실패({type(e).__name__}: {e})")
+
+    return report
+
+
+def _check_a0_form(path, info: dict, config_dir: str, config_file: str = "a0.yaml",
+                   template: str = None) -> list:
+    """총괄표 양식 무결성 게이트(격자·열잘림·헤더존재·헤더채움색) — config 주도로 조서 무관."""
+    from validator import (validate_grid, check_column_fit, check_cells_present,
+                           check_header_fill)
+    from openpyxl.utils import column_index_from_string
+    import yaml
+
+    cfg = yaml.safe_load((Path(config_dir) / config_file).read_text(encoding="utf-8"))
+    sheet = cfg["sheet"]
+    b = cfg["body"]
+    cols = b["columns"]
+    ds, de = info["body_data_start"], info["body_data_end"]
+    hr = b["header_row"]
+    # 리터럴 값 열(계정명/기초/기말/수정사항)만 너비검사(수식열은 텍스트길이 오탐 제외)
+    lit = [cols[k] for k in ("계정명", "기초", "기말", "수정사항") if k in cols]
+    lit_ci = [column_index_from_string(c) for c in lit]
+    grid_ci = sorted(set(lit_ci + [column_index_from_string(c) for c in b.get("num_cols", [])]))
+    out = []
+    out += validate_grid(path, sheet, header_row=hr, data_start=ds,
+                         n_rows=de - ds + 1, cols=grid_ci)
+    out += check_column_fit(path, sheet, cols=lit_ci, data_start=ds, data_end=de, header_row=hr)
+    out += check_cells_present(path, sheet,
+                               [f"{cols['계정명']}{hr}", f"{cols['기초']}{hr}"])
+    # 헤더 채움색 보존 검사(소실·파란색 변질 방지) — 템플릿과 대조
+    if template:
+        out += check_header_fill(path, template, sheet, header_row=hr, cols=grid_ci)
+    return out
+
+
+def routing_completeness(settlement, config_dir, config_files, *, parsed_dir=None):
+    """정산표 전 대분류가 조서 config들에 1:1로 소유되는지 검사(중복·누락 안전망).
+
+    Returns: {"unmapped":[대분류...], "duplicate":{대분류:[조서...]}, "owned":N}
+    """
+    from extractors import parse_trial_balance
+    import yaml
+
+    owned: dict = {}
+    for cf in config_files:
+        cfg = yaml.safe_load((Path(config_dir) / cf).read_text(encoding="utf-8"))
+        sheet = cfg.get("sheet", cf)
+        # 엔진형: body.sections.groups
+        for sec in cfg.get("body", {}).get("sections", []):
+            for g in sec.get("groups", []):
+                owned.setdefault(g, []).append(sheet)
+        # 특수형(refill/capital): name_map의 문자열 target = 소유 대분류(규칙 dict은 제외 — 키워드 집계라 대분류 단정 불가)
+        for tgt in cfg.get("name_map", {}).values():
+            if isinstance(tgt, str):
+                owned.setdefault(tgt, []).append(sheet)
+        # 매출형(sales): is_groups만 소유. bs_rows는 교차참조(주 소유는 C/AA)라 소유로 안 침.
+        for g in cfg.get("is_groups", []):
+            owned.setdefault(g, []).append(sheet)
+    tb = parse_trial_balance(settlement)
+    present = {r["대분류"] for r in tb
+              if any(r.get(k) not in (None, 0) for k in ("기초", "기말", "수정후"))}
+    return {
+        "unmapped": sorted(present - set(owned)),
+        "duplicate": {k: v for k, v in owned.items() if len(v) > 1},
+        "owned": len(owned),
+    }
+
+
+def build_special(*, kind, settlement, template, config_dir, config_file, output,
+                  parsed_dir=None):
+    """특수 총괄표(고정격자 리필·자본·매출원가·매출)를 생성한다.
+
+    엔진(a0.py 섹션 렌더)으로 안 맞는 조서용. kind별 fill 함수로 분기한다:
+      refill  → generators.refill.fill_refill   (R-2 인건비 등 고정 계산행)
+      capital → generators.capital.fill_capital (GG 자본)
+      cogs    → generators.sales.fill_cogs       (Q 매출원가, 공사원가 롤포워드+상품매출원가)
+      sales   → generators.sales.fill_sales      (P 매출, IS 동적+BS 교차참조)
+    정산표 파싱은 build_a0과 같은 해시캐시를 공유한다(재파싱 0). 생성 후 경량 양식게이트.
+    """
+    import yaml
+    from extractors import parse_trial_balance, parse_adjustments
+
+    cfg_dir = Path(config_dir)
+    out = Path(output)
+    parsed = parsed_dir or str(out.parent / "변환자료")
+    report = RunReport()
+    _PARSER_VER = "v2"
+
+    def _cached(fn, src, tag):
+        return load_with_cache(src, fn, cache_dir=parsed, tag=f"{tag}_{_PARSER_VER}")
+
+    try:
+        tb_rows = _cached(parse_trial_balance, settlement, "trial_balance")
+        report.add("입력", "ok" if tb_rows else "warn", f"별도정산표: {len(tb_rows)}행")
+    except Exception as e:
+        tb_rows = []
+        report.add("입력", "error", f"별도정산표 처리 실패({type(e).__name__}: {e})")
+
+    cfg = yaml.safe_load((cfg_dir / config_file).read_text(encoding="utf-8"))
+    work = str(out)
+    shutil.copy(template, work)
+    try:
+        if kind == "refill":
+            from generators.refill import fill_refill
+            res = fill_refill(work, tb_rows, work, cfg)
+        elif kind == "capital":
+            from generators.capital import fill_capital
+            adj = _cached(parse_adjustments, settlement, "adjustments")
+            res = fill_capital(work, tb_rows, adj, work, cfg)
+        elif kind == "cogs":
+            from generators.sales import fill_cogs
+            res = fill_cogs(work, tb_rows, work, cfg)
+        elif kind == "sales":
+            from generators.sales import fill_sales
+            res = fill_sales(work, tb_rows, work, cfg)
+        else:
+            raise ValueError(f"알 수 없는 kind: {kind}")
+        report.add("생성", "ok", f"{cfg.get('sheet')} 생성 {res}")
+    except Exception as e:
+        report.add("생성", "error", f"생성 실패({type(e).__name__}: {e}) → 양식 기본값")
+
+    # 경량 양식게이트(고정격자라 테두리는 보존됨 → 열 잘림 위주). 값열을 너비검사.
+    try:
+        for issue in _check_special_form(work, cfg):
+            report.add("출력", "warn", issue)
+    except Exception as e:
+        report.add("출력", "warn", f"양식무결성 검사 실패({type(e).__name__}: {e})")
+    return report
+
+
+def _check_special_form(path, cfg: dict) -> list:
+    """특수조서 경량 양식게이트: 숫자 값열(기초·기말·수정)의 ####### 위험만 검사한다.
+
+    고정격자 템플릿이라 테두리·헤더는 in-place로 보존된다. 유일한 실위험은 큰 금액이
+    열 너비를 넘어 #######로 잘리는 것. 수식/대사설명 텍스트는 표시값이 다르므로 제외
+    (그 길이로 너비를 재면 오탐 → 사용자 불필요 크로스체크). 실제 숫자 셀만 잰다.
+    """
+    import openpyxl
+    from openpyxl.utils import column_index_from_string
+
+    sheet = cfg["sheet"]
+    val_cols = [cfg[k] for k in ("base_col", "end_col", "adj_col") if cfg.get(k)]
+    wb = openpyxl.load_workbook(path)
+    ws = wb[sheet]
+    issues = []
+    for col in val_cols:
+        ci = column_index_from_string(col)
+        maxlen = max((len(f"{v:,.0f}") for r in range(1, ws.max_row + 1)
+                      if isinstance((v := ws.cell(r, ci).value), (int, float))
+                      and not isinstance(v, bool)), default=0)
+        if maxlen == 0:
+            continue
+        width = ws.column_dimensions[col].width or 8.43
+        if width + 1 < maxlen:
+            issues.append(f"[너비] {sheet} {col}열: 너비 {width:.0f} < 숫자 {maxlen}자 (####### 위험)")
+    wb.close()
+    return issues
+
+
+def build_lead_all(*, settlement, registry, config_dir, template_root, output_dir,
+                   params=None, parsed_dir=None):
+    """레지스트리의 모든 총괄표를 일괄 생성한다(엔진형 + 특수형 통합).
+
+    정산표 파싱은 변환자료에 캐시되어 조서 간 공유된다(재파싱 0). 마지막에 라우팅
+    완전성(대분류 중복·누락)을 함께 점검한다(엔진형 config 기준).
+
+    registry 항목: {"code","config","template", "kind"?}
+      kind 생략/"engine" → build_a0(섹션 렌더). "refill"/"capital"/"cogs"/"sales" → build_special.
+    Returns: ({code: RunReport}, completeness_dict)
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    parsed = parsed_dir or str(out_dir.parent / "변환자료")
+    reports = {}
+    engine_configs = []
+    for item in registry:
+        kind = item.get("kind", "engine")
+        tmpl = str(Path(template_root) / item["template"])
+        outp = str(out_dir / f"{item['code']}.xlsx")
+        if kind == "engine":
+            reports[item["code"]] = build_a0(
+                settlement=settlement, template=tmpl, config_dir=config_dir,
+                output=outp, params=params, parsed_dir=parsed, config_file=item["config"])
+        else:
+            reports[item["code"]] = build_special(
+                kind=kind, settlement=settlement, template=tmpl, config_dir=config_dir,
+                config_file=item["config"], output=outp, parsed_dir=parsed)
+        engine_configs.append(item["config"])
+    comp = routing_completeness(settlement, config_dir, engine_configs, parsed_dir=parsed)
+    return reports, comp

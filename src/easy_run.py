@@ -70,8 +70,8 @@ def _ask(label: str, required: bool = True, example: str = "") -> str:
 
 
 def _find_template() -> "str | None":
-    """템플릿 폴더에서 A-1 시트 구조를 가진 .xlsx를 동적으로 찾는다(파일명 무관)."""
-    candidates = [h for h in glob.glob(str(TEMPLATE_DIR / "**" / "*.xlsx"), recursive=True)
+    """템플릿 폴더에서 A-1 시트 구조를 가진 엑셀(.xlsx/.xlsm/.xls)을 동적으로 찾는다(파일명 무관)."""
+    candidates = [h for h in glob.glob(str(TEMPLATE_DIR / "**" / "*.xls*"), recursive=True)
                   if "~$" not in h]
     for path in sorted(candidates):
         try:

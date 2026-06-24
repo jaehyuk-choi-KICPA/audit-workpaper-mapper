@@ -114,10 +114,16 @@ class WorkpaperGenerator:
 
         템플릿에 격자가 미리 그려진 고정표(예: Control Sheet)에 데이터를 채울 때 사용.
         (clear_region은 스타일까지 리셋하므로 미리 그려진 격자를 파괴 → 고정표엔 금지)
+
+        병합 영역의 비-앵커 셀(MergedCell)은 읽기전용이라 건너뛴다(앵커만 비우면 값이 사라짐).
         """
+        from openpyxl.cell.cell import MergedCell
         for row in range(start, end + 1):
             for col in range(1, self.ws.max_column + 1):
-                self.ws.cell(row=row, column=col).value = None
+                c = self.ws.cell(row=row, column=col)
+                if isinstance(c, MergedCell):
+                    continue
+                c.value = None
 
     def clear_region(self, start: int, end: int) -> None:
         """행 범위의 값·스타일·병합을 초기화한다(동적 재구성 전제).

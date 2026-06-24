@@ -123,6 +123,45 @@ def check_outside_col_fill(path: str, sheet_name: str, *,
     return issues
 
 
+def check_header_fill(path: str, template_path: str, sheet_name: str, *,
+                      header_row: int, cols) -> list[str]:
+    """생성본 헤더 행의 채움색(fill)이 **템플릿과 동일**한지 검사한다.
+
+    데이터 채우기 중 헤더 색이 (1) 소실되거나 (2) 다른 색(예: 파란색)으로 변질되는
+    반복 사고를 프로그래밍으로 잡는 게이트. 헤더는 절대 새 색을 입히지 말고 템플릿 색을
+    그대로 보존해야 한다(clear_region 후엔 capture_row/stamp_row로 원래 fill째 재현).
+    """
+    from openpyxl.utils import get_column_letter
+
+    def _fkey(c):
+        f = c.fill
+        if f is None or getattr(f, "patternType", None) in (None, "none", ""):
+            return None
+        fg = getattr(f, "fgColor", None)
+        return (f.patternType, getattr(fg, "rgb", None), getattr(fg, "theme", None),
+                getattr(fg, "indexed", None), getattr(fg, "tint", None))
+
+    wt = openpyxl.load_workbook(template_path)
+    wo = openpyxl.load_workbook(path)
+    if sheet_name not in wt.sheetnames or sheet_name not in wo.sheetnames:
+        wt.close(); wo.close()
+        return []
+    tws, ows = wt[sheet_name], wo[sheet_name]
+    issues = []
+    for ci in cols:
+        tk = _fkey(tws.cell(header_row, ci))
+        ok = _fkey(ows.cell(header_row, ci))
+        if tk != ok:
+            col = get_column_letter(ci)
+            if tk and not ok:
+                issues.append(f"[헤더색] {sheet_name} {col}{header_row}: 헤더 채움색 소실(템플릿엔 있음)")
+            else:
+                issues.append(f"[헤더색] {sheet_name} {col}{header_row}: "
+                              f"헤더 채움색 변질(템플릿과 다름 — 파란색 등 변경 주의)")
+    wt.close(); wo.close()
+    return issues
+
+
 def validate_a200_form(path: str, sheet_name: str, config: dict) -> list[str]:
     """생성된 A-200 시트의 양식 무결성을 검사한다.
 

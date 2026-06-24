@@ -1,5 +1,6 @@
 """파일 해시 기반 파싱 캐시 유틸."""
 
+import datetime as _dt
 import json
 from hashlib import sha256
 from pathlib import Path
@@ -11,30 +12,78 @@ def file_hash(path: str) -> str:
     return sha256(Path(path).read_bytes()).hexdigest()[:16]
 
 
-def load_with_cache(path: str, parse_fn: Callable, **kwargs) -> list | dict:
+# ---------------------------------------------------------------------------
+# 타입 보존 JSON 코덱
+#
+# 파서 결과에는 엑셀 날짜셀(datetime/date)이 그대로 담길 수 있다(예: 대출일·
+# 최종만기일). 일반 JSON으로 직렬화하면 문자열로 변질되어, 생성기가 셀에 쓸 때
+# 날짜 서식이 깨진다(양식 무결성 위반). 날짜류는 태그를 붙여 왕복 보존한다.
+# 그 외 비직렬화 타입은 str 폴백(기존 동작과 동일).
+# ---------------------------------------------------------------------------
+
+def _json_default(o):
+    if isinstance(o, (_dt.datetime, _dt.date, _dt.time)):
+        return {"__kind__": type(o).__name__, "__iso__": o.isoformat()}
+    return str(o)
+
+
+def _decode_obj(d: dict):
+    kind = d.get("__kind__")
+    if kind and "__iso__" in d:
+        iso = d["__iso__"]
+        try:
+            if kind == "datetime":
+                return _dt.datetime.fromisoformat(iso)
+            if kind == "date":
+                return _dt.date.fromisoformat(iso)
+            if kind == "time":
+                return _dt.time.fromisoformat(iso)
+        except ValueError:
+            return iso  # 손상된 값은 문자열로(견고성)
+    return d
+
+
+def load_with_cache(path: str, parse_fn: Callable, *,
+                    cache_dir: str | None = None, tag: str | None = None,
+                    **kwargs) -> list | dict:
     """엑셀 파일을 파싱하고 결과를 JSON으로 캐시한다.
 
     파일 내용의 SHA-256 앞 16자리를 캐시 키로 사용한다.
     파일이 변경되면 해시가 달라지므로 자동으로 재파싱된다.
-    캐시는 _internal/cache/ 에 저장되어 git 추적에서 제외된다.
+
+    Args:
+        cache_dir: 캐시 저장 폴더. None이면 `_internal/cache`(개발 기본).
+                   파이프라인은 배포 모델에 맞춰 `변환자료/`(parsed_dir)를 넘긴다.
+        tag:       같은 파일을 여러 파서가 캐시할 때 키 충돌을 막는 식별자
+                   (예: 취합엑셀을 bank/insurance/invest가 각각 파싱). None이면
+                   `parse_fn.__name__`을 사용한다.
+        **kwargs:  parse_fn에 그대로 전달.
 
     사용 예:
         rows = load_with_cache(path, parse_ledger)
-        rows = load_with_cache(path, parse_cs, sheet_name="My Sheet")
+        rows = load_with_cache(path, parse_bank, cache_dir=parsed, tag="bank")
     """
-    cache_dir = Path("_internal/cache")
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cdir = Path(cache_dir) if cache_dir else Path("_internal/cache")
+    cdir.mkdir(parents=True, exist_ok=True)
 
-    cache_file = cache_dir / f"{Path(path).stem}_{file_hash(path)}.json"
+    label = tag or getattr(parse_fn, "__name__", "parse")
+    cache_file = cdir / f"{Path(path).stem}__{label}_{file_hash(path)}.json"
 
     if cache_file.exists():
-        return json.loads(cache_file.read_text(encoding="utf-8"))
+        try:
+            return json.loads(cache_file.read_text(encoding="utf-8"),
+                              object_hook=_decode_obj)
+        except Exception:
+            pass  # 캐시 손상 → 아래에서 재파싱
 
     result = parse_fn(path, **kwargs)
-    cache_file.write_text(
-        json.dumps(result, ensure_ascii=False, default=str),
-        encoding="utf-8",
-    )
+    try:
+        cache_file.write_text(
+            json.dumps(result, ensure_ascii=False, default=_json_default),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass  # 캐시 기록 실패해도 결과는 반환(견고성 — 절대 전체실패 금지)
     return result
 
 
