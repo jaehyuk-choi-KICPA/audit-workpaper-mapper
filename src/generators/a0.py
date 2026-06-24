@@ -103,11 +103,24 @@ class A0Generator(WorkpaperGenerator):
                 self.ws[f"{col}{r}"] = tmpl.format(r=r)
                 setfmt(col, r)
 
+        # groups_flag: 명시 목록 대신 정산표의 플래그(예: 판관비) True 대분류를 정산표 순서로
+        # 수집(회사불문 — 명칭변형·신규계정 자동 포함). 비면 section["groups"]로 폴백(안전망).
+        def _section_groups(section):
+            flag = section.get("groups_flag")
+            if not flag:
+                return section.get("groups", [])
+            seen, dyn = set(), []
+            for r in tb_rows:
+                k = r["대분류"]
+                if r.get(flag) and k not in seen:
+                    seen.add(k); dyn.append(k)
+            return dyn or section.get("groups", [])
+
         # 렌더할 섹션/그룹(있는 대분류만) + 필요한 행수 계산
         live = []
         needed = 0
         for section in b["sections"]:
-            groups = [g for g in section["groups"]
+            groups = [g for g in _section_groups(section)
                       if by_class.get(g) and _nonzero_group(by_class[g])]
             if not groups:
                 continue

@@ -92,9 +92,19 @@ def parse_trial_balance(path: str, sheet_name: str = _DEFAULT_SHEET) -> list[dic
         return row[j] if j is not None and j < len(row) else None
 
     result = []
+    # 판매비와관리비 섹션 추적: 그 안의 상세행에 판관비=True 플래그. R(판관비) 총괄표가 회사마다
+    # 다른 계정명(하자보수비·잡비·접대비·세금과공과 등)을 명시목록 없이 섹션 통째로 렌더하게 한다.
+    # (제조원가명세서 플래그와 동일 패턴.) 섹션은 'Ⅳ.판매비와관리비'~'영업손익/영업외'에서 끝.
+    판관비_section = False
     for row in rows[header_idx + 1:]:
         대분류 = g(row, "대분류")
         계정명 = g(row, "계정명")
+        _nm = str(계정명 or "")
+        if "판매비와관리비" in _nm or "판매비및관리비" in _nm or "판매비와 관리비" in _nm:
+            판관비_section = True
+            continue
+        if 판관비_section and any(k in _nm for k in ("영업손익", "영업이익", "영업외", "영업비용")):
+            판관비_section = False
         # 상세행만: 대분류(공시용) 있고, 소계/합계/섹션머리 아님
         if 대분류 is None or str(대분류).strip() == "":
             continue
@@ -115,6 +125,7 @@ def parse_trial_balance(path: str, sheet_name: str = _DEFAULT_SHEET) -> list[dic
         result.append({
             "계정명": str(계정명).strip() if 계정명 is not None else None,
             "대분류": str(대분류).strip(),
+            "판관비": 판관비_section,
             "기초": 기초 if _is_amount(기초) else None,
             "기말": 기말 if _is_amount(기말) else None,
             "수정차변": dr,

@@ -254,7 +254,7 @@ def build_a0(*, settlement, template, config_dir, output, params=None, parsed_di
     report = RunReport()
 
     # 캐시 태그에 파서 버전을 포함 → 파서 코드가 바뀌면 캐시가 자동 무효화(소스 해시만으론 못 잡음).
-    _PARSER_VER = "v2"
+    _PARSER_VER = "v3"
 
     def _cached(fn, src, tag):
         return load_with_cache(src, fn, cache_dir=parsed, tag=f"{tag}_{_PARSER_VER}")
@@ -338,14 +338,20 @@ def routing_completeness(settlement, config_dir, config_files, *, parsed_dir=Non
     from extractors import parse_trial_balance
     import yaml
 
+    tb = parse_trial_balance(settlement)
     owned: dict = {}
     for cf in config_files:
         cfg = yaml.safe_load((Path(config_dir) / cf).read_text(encoding="utf-8"))
         sheet = cfg.get("sheet", cf)
-        # 엔진형: body.sections.groups
+        # 엔진형: body.sections.groups (+ groups_flag=정산표 플래그로 동적 소유)
         for sec in cfg.get("body", {}).get("sections", []):
             for g in sec.get("groups", []):
                 owned.setdefault(g, []).append(sheet)
+            flag = sec.get("groups_flag")
+            if flag:
+                for r in tb:
+                    if r.get(flag):
+                        owned.setdefault(r["대분류"], []).append(sheet)
         # 특수형(refill/capital): name_map의 문자열 target = 소유 대분류(규칙 dict은 제외 — 키워드 집계라 대분류 단정 불가)
         for tgt in cfg.get("name_map", {}).values():
             if isinstance(tgt, str):
@@ -353,12 +359,12 @@ def routing_completeness(settlement, config_dir, config_files, *, parsed_dir=Non
         # 매출형(sales): is_groups만 소유. bs_rows는 교차참조(주 소유는 C/AA)라 소유로 안 침.
         for g in cfg.get("is_groups", []):
             owned.setdefault(g, []).append(sheet)
-    tb = parse_trial_balance(settlement)
     present = {r["대분류"] for r in tb
               if any(r.get(k) not in (None, 0) for k in ("기초", "기말", "수정후"))}
     return {
         "unmapped": sorted(present - set(owned)),
-        "duplicate": {k: v for k, v in owned.items() if len(v) > 1},
+        # 같은 조서가 groups+groups_flag로 중복 등록될 수 있어 시트 유니크 기준으로 판정.
+        "duplicate": {k: u for k, v in owned.items() if len(u := sorted(set(v))) > 1},
         "owned": len(owned),
     }
 
@@ -381,7 +387,7 @@ def build_special(*, kind, settlement, template, config_dir, config_file, output
     out = Path(output)
     parsed = parsed_dir or str(out.parent / "변환자료")
     report = RunReport()
-    _PARSER_VER = "v2"
+    _PARSER_VER = "v3"
 
     def _cached(fn, src, tag):
         return load_with_cache(src, fn, cache_dir=parsed, tag=f"{tag}_{_PARSER_VER}")
