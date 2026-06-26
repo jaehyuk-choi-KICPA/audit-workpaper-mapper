@@ -20,7 +20,7 @@ import re
 from openpyxl.cell.cell import MergedCell
 from openpyxl.utils import column_index_from_string
 
-from .base import WorkpaperGenerator
+from .base import WorkpaperGenerator, shift_formula_rows
 
 
 def _norm(s) -> str:
@@ -43,8 +43,10 @@ class A0Generator(WorkpaperGenerator):
         self.open_template()
         cfg = self.config
         body_end = self._fill_body(tb_rows, cfg["body"])
+        n_detail = self._fill_detail_cells(tb_rows, cfg.get("detail_cells"))
         adj_end, n_adj = self._fill_adjustments(tb_rows, adj_entries, cfg["body"], cfg["adjustments"])
         return {
+            "n_detail": n_detail,
             "body_data_start": cfg["body"]["data_start_row"],
             "body_data_end": body_end,
             "adj_start": cfg.get("adjustments", {}).get("data_start_row"),
@@ -120,11 +122,17 @@ class A0Generator(WorkpaperGenerator):
             flag = section.get("groups_flag")
             if not flag:
                 return section.get("groups", [])
+            # exclude_kw: 이 flag(예: 유동부채)에 걸리지만 다른 조서가 소유하는 대분류는 제외
+            # (예: CC가 유동부채를 흡수하되 매입채무[AA]·차입금[BBDD]·퇴직급여충당[EE]은 빼고).
+            excl = [_norm(x) for x in section.get("exclude_kw", [])]
             seen, dyn = set(), []
             for r in tb_rows:
                 k = r["대분류"]
-                if r.get(flag) and k not in seen:
-                    seen.add(k); dyn.append(k)
+                if not r.get(flag) or k in seen:
+                    continue
+                if any(e and e in _norm(k) for e in excl):
+                    continue
+                seen.add(k); dyn.append(k)
             return dyn or section.get("groups", [])
 
         # 렌더할 섹션/그룹(있는 대분류만) + 필요한 행수 계산
@@ -171,6 +179,9 @@ class A0Generator(WorkpaperGenerator):
             for ref in saved:
                 self.ws.unmerge_cells(ref)
             self.ws.insert_rows(ds_row, delta)
+            # 본문 아래로 밀린 보존영역 수식(예: G 감가상각비 명세 SUM·체크)의 행참조 +delta 보정.
+            # 본문 구간은 이미 clear_values로 비어 있어 영향 없고, 보존영역만 Excel처럼 재정렬된다.
+            shift_formula_rows(self.ws, ds_row, delta)
             for ref in saved:
                 rng = CellRange(ref); rng.shift(0, delta)
                 self.ws.merge_cells(str(rng))
@@ -185,26 +196,33 @@ class A0Generator(WorkpaperGenerator):
             if rng.min_row <= last_render and rng.max_row >= ds_row:
                 self.ws.unmerge_cells(ref)
 
-        # 렌더(도너 스타일 적용 → 삽입 행도 테두리 보존)
+        # 렌더(도너 스타일 적용). 단, **기존 템플릿 행은 fill 보존**(skip_fill) — clear_values가
+        #   값만 비워 회색 banding 등은 남아 있으므로, 도너 단일 fill로 덮지 않고 폰트·테두리·서식만
+        #   통일한다. 새로 삽입된 행(blank)만 도너 fill까지 입혀 banding을 잇는다.
+        ins_until = ds_row + max(0, delta)        # [ds_row, ins_until) = 삽입된 빈 행(도너 fill 필요)
+
+        def _astyle(rr, st):
+            self.apply_row_style(rr, st, skip_fill=(rr >= ins_until))
+
         r = ds_row
         for section, groups in live:
             if section.get("marker"):
-                self.apply_row_style(r, dm)
+                _astyle(r, dm)
                 wset(f'{marker_col}{r}', section["marker"])
                 r += 1
             sec_first = r
             for g in groups:
                 grp_first = r
                 for rec in by_class[g]:
-                    self.apply_row_style(r, dd)
+                    _astyle(r, dd)
                     render_detail(r, rec)
                     r += 1
                 if scope == "group":
-                    self.apply_row_style(r, dsub)
+                    _astyle(r, dsub)
                     render_subtotal(r, grp_first, r - 1)
                     r += 1
             if scope == "section":
-                self.apply_row_style(r, dsub)
+                _astyle(r, dsub)
                 render_subtotal(r, sec_first, r - 1, label=section.get("subtotal_label"))
                 r += 1
         # 계정명 열 너비 보정(긴 계정명) + 숫자/율 열 최소 너비 보장(긴 금액 ####### 방지)
@@ -216,6 +234,59 @@ class A0Generator(WorkpaperGenerator):
             cur = self.ws.column_dimensions[c].width or 0
             self.ws.column_dimensions[c].width = max(cur, 8)
         return r - 1
+
+    # ---- 보존영역 고정 명세표(예: G 감가상각비 명세) ----
+    def _fill_detail_cells(self, tb_rows, dc):
+        """body_end_anchor 아래 보존영역의 **명세표**를 정산표 금액으로 채운다(엔진 본문과 별개).
+
+        명세표 행은 **라벨로 동적 탐색**한다(절대 행번호 아님 — 본문 행삽입으로 명세표가 밀려도 안전).
+        config `detail_cells`:
+          name_col/div_col : 행을 식별하는 라벨 두 열(예: 계정과목 C, 구분 D)
+          rows[].match_row : {name_col값, div_col값}로 명세표 행 탐색
+          rows[].tb        : {대분류[, flag]}로 정산표 행 매칭
+          rows[].cols      : {열문자: 소스필드}  예) {E: 기초, F: 기말, G: 수정사항}
+        합계·증감 등은 템플릿 수식이 처리. 매칭 없으면 입력열을 빈칸(타사 잔재 방지).
+        """
+        if not dc:
+            return 0
+        numf = dc.get("num_format")
+        nci = column_index_from_string(dc.get("name_col", "C"))
+        dci = column_index_from_string(dc.get("div_col", "D"))
+        specs = dc.get("rows", [])
+
+        def _find_row(mr):
+            want_n = _norm(mr.get(dc.get("name_col", "C")) or mr.get("계정과목"))
+            want_d = _norm(mr.get(dc.get("div_col", "D")) or mr.get("구분"))
+            for r in range(1, self.ws.max_row + 1):
+                if _norm(self.ws.cell(r, nci).value) == want_n and \
+                   _norm(self.ws.cell(r, dci).value) == want_d:
+                    return r
+            return None
+
+        n = 0
+        for spec in specs:
+            row = _find_row(spec.get("match_row", {}))
+            if row is None:
+                continue
+            cols = spec.get("cols", {})
+            for col in cols:                        # 입력열 먼저 비움(매칭 없으면 빈칸 유지)
+                self.ws[f"{col}{row}"] = None
+            t = spec.get("tb", {})
+            cls = _norm(t.get("대분류"))
+            flag = t.get("flag")
+            rec = next((r for r in tb_rows if _norm(r.get("대분류")) == cls
+                        and (not flag or r.get(flag))), None)
+            if rec is None:
+                continue
+            for col, src in cols.items():
+                val = rec.get(src)
+                if val in (0, None):
+                    continue
+                self.ws[f"{col}{row}"] = val
+                if numf:
+                    self.ws[f"{col}{row}"].number_format = numf
+            n += 1
+        return n
 
     # ---- 수정사항(분개 재현) ----
     def _fill_adjustments(self, tb_rows, adj_entries, b, a):

@@ -15,6 +15,41 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 import yaml
 
 
+# 셀참조: 선택적 $ + 열(1~3자) + 선택적 $ + 행번호. 앞은 영숫자/_/!(시트참조) 아님,
+# 뒤는 영숫자/_/'(' 아님 → 함수명(LOG10()·정의된이름(Q1Total) 오인 방지.
+_REF_RE = re.compile(r"(?<![A-Za-z0-9_!])(\$?)([A-Z]{1,3})(\$?)(\d+)(?![A-Za-z0-9_(])")
+
+
+def shift_formula_rows(ws, at_row: int, n: int) -> int:
+    """ws의 모든 수식에서 at_row 이상을 가리키는 **행참조를 +n** 이동(insert_rows 직후 호출).
+
+    openpyxl `insert_rows`는 셀 값·스타일만 내리고 **수식 문자열의 행참조는 그대로** 두므로,
+    삽입 지점 아래로 밀린 보존영역 수식(예: EE PL표 `=E35-D35`, 체크행)이 엉뚱한 행(빈셀·텍스트
+    헤더)을 가리켜 #VALUE!/#DIV/0!/#REF!가 난다. Excel처럼 at_row 이상 행참조를 일괄 +n 한다.
+    같은 시트 단순 셀참조(A1·$A$1·범위 양끝)만 대상 — 시트간 참조('시트'!A1)는 `!` 뒤라 제외.
+    이후 생성기가 명시적으로 덮어쓰는 셀(본문·합계)은 정상 수식으로 다시 써지므로 무해하다.
+    Returns: 바뀐 수식 셀 수.
+    """
+    if n <= 0:
+        return 0
+
+    def bump(m):
+        dc, col, dr, row = m.groups()
+        rr = int(row)
+        return f"{dc}{col}{dr}{rr + n if rr >= at_row else rr}"
+
+    changed = 0
+    for row in ws.iter_rows():
+        for cell in row:
+            v = cell.value
+            if isinstance(v, str) and v.startswith("="):
+                nv = _REF_RE.sub(bump, v)
+                if nv != v:
+                    cell.value = nv
+                    changed += 1
+    return changed
+
+
 def apply_col_offset(cfg: dict) -> dict:
     """config의 `col_offset`만큼 본문 컬럼 참조를 일괄 +이동(로드 시 1회).
 
@@ -155,8 +190,12 @@ class WorkpaperGenerator:
             }
         return styles
 
-    def apply_row_style(self, row: int, styles: dict) -> None:
-        """capture_row_style로 캡처한 스타일(+행 높이)을 지정 행에 입힌다."""
+    def apply_row_style(self, row: int, styles: dict, skip_fill: bool = False) -> None:
+        """capture_row_style로 캡처한 스타일(+행 높이)을 지정 행에 입힌다.
+
+        skip_fill=True면 채움색(fill)은 건드리지 않는다 — 템플릿에 이미 있는 행(회색 banding 등)에
+        도너의 단일 fill을 덮어써 banding이 뭉개지는 것을 막기 위함(폰트·테두리·서식만 통일).
+        """
         h = styles.get("_height")
         if h is not None:
             self.ws.row_dimensions[row].height = h
@@ -166,7 +205,8 @@ class WorkpaperGenerator:
             c = self.ws.cell(row=row, column=col)
             c.font = copy(st["font"])
             c.border = copy(st["border"])
-            c.fill = copy(st["fill"])
+            if not skip_fill:
+                c.fill = copy(st["fill"])
             c.alignment = copy(st["alignment"])
             c.number_format = st["number_format"]
 

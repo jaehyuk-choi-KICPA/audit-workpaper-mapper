@@ -219,16 +219,39 @@ def _inline_shared_strings(sheet_xml: str, sst_bytes: "bytes | None") -> str:
     return re.sub(r'<c\b[^>]*\bt="s"[^>]*>.*?</c>', repl, sheet_xml, flags=re.DOTALL)
 
 
+# 스타일 인덱스 속성은 셀/행/열의 ' s="N"'(앞에 공백). **단어경계(\b)** 로 한정해야
+# showGridLines="0"/showZeros="0" 같은 's'로 끝나는 다른 속성의 's="0"'을 오인·훼손하지 않는다.
+# (과거: s="(\d+)"가 showGridLines="0"의 s="0"을 잡아 격자선 설정을 깨뜨림 → 빈칸 박스선 사고.)
+_S_ATTR = re.compile(r'\bs="(\d+)"')
+
+
 def _remap_style_indices(sheet_xml: str, xf_map: dict) -> str:
-    """워크시트 XML의 모든 s="N"(셀·행·열 공통)을 xf_map으로 치환."""
+    """워크시트 XML의 셀·행·열 스타일 s="N"을 xf_map으로 치환(다른 속성의 s= 는 제외)."""
     def repl(m):
         old = int(m.group(1))
         return f's="{xf_map.get(old, old)}"'
-    return re.sub(r's="(\d+)"', repl, sheet_xml)
+    return _S_ATTR.sub(repl, sheet_xml)
 
 
 def _used_style_indices(sheet_xml: str) -> set:
-    return {int(x) for x in re.findall(r's="(\d+)"', sheet_xml)}
+    return {int(x) for x in _S_ATTR.findall(sheet_xml)}
+
+
+# 열 정의(<cols>) — openpyxl(gen)이 catch-all 열(min=42..16384)에 customWidth="1"을 덧붙여
+# Excel이 인쇄범위를 16384열까지 "사용자지정폭"으로 잡고 FitToPagesWide=1이 전부 축소 → 우측
+# 빈칸이 격자처럼 보이는 사고. 열 너비는 행 삽입과 무관하므로 완성본 원본 <cols>로 통째 교체.
+# (원본 cols의 스타일 인덱스는 merged styles의 base이므로 그대로 유효 — 재매핑 불필요.)
+_COLS_RE = re.compile(r"<cols>.*?</cols>", re.DOTALL)
+
+
+def _restore_template_cols(gen_xml: str, full_sheet_xml: str) -> str:
+    m = _COLS_RE.search(full_sheet_xml)
+    tmpl_cols = m.group(0) if m else None
+    if tmpl_cols is None:                       # 템플릿에 cols 없음 → gen cols 제거
+        return _COLS_RE.sub("", gen_xml, count=1)
+    if _COLS_RE.search(gen_xml):
+        return _COLS_RE.sub(lambda _: tmpl_cols, gen_xml, count=1)
+    return gen_xml.replace("<sheetData", tmpl_cols + "<sheetData", 1)  # gen에 cols 없음 → 삽입
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +388,7 @@ def graft_sheet(full_path: str, generated_path: str, sheet_name: str,
     used = _used_style_indices(sheet_xml)
     merged_styles, xf_map = _merge_styles(base_styles, gen_styles, used)
     sheet_xml = _remap_style_indices(sheet_xml, xf_map)
+    sheet_xml = _restore_template_cols(sheet_xml, full_data[full_part].decode("utf-8"))
     sheet_bytes = (_XMLDECL + sheet_xml.encode("utf-8")) if not sheet_xml.startswith("<?xml") \
         else sheet_xml.encode("utf-8")
 
@@ -391,5 +415,15 @@ def graft_sheet(full_path: str, generated_path: str, sheet_name: str,
                 b = full_data[name]
                 b = re.sub(rb'<Override[^>]*calcChain[^>]*/>', b'', b)
                 out.writestr(name, b)
+            elif name == "xl/workbook.xml":
+                # calcChain을 떼고 openpyxl 수식엔 캐시값이 없으므로, Excel이 열 때 전체 재계산하도록
+                # calcPr에 fullCalcOnLoad="1" 주입(없으면). 안 하면 수식 결과가 빈칸으로 보임.
+                b = full_data[name].decode("utf-8")
+                if "fullCalcOnLoad" not in b:
+                    if "<calcPr" in b:
+                        b = re.sub(r"<calcPr\b([^>]*?)/>", r'<calcPr\1 fullCalcOnLoad="1"/>', b, count=1)
+                    else:  # calcPr 없으면 sheets 앞에 추가
+                        b = b.replace("<sheets>", '<calcPr calcId="191029" fullCalcOnLoad="1"/><sheets>', 1)
+                out.writestr(name, b.encode("utf-8"))
             else:
                 out.writestr(name, full_data[name])

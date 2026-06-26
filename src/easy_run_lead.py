@@ -15,7 +15,11 @@
 import glob
 import os
 import sys
+import warnings
 from pathlib import Path
+
+# openpyxl이 머리말/꼬리말을 못 읽을 때 내는 무해한 경고 숨김(결과 영향 없음).
+warnings.filterwarnings("ignore", message=".*[Hh]eader or footer.*")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -105,12 +109,22 @@ def main():
     reviewer = _ask("검토자(Reviewer)", required=False, example="KHK")
 
     out_dir = OUTPUT_DIR / company
-    _line("\n생성 중... (조서별 추출→매핑→이식, 수십 초 소요될 수 있습니다)")
+    _line("\n생성 중... (조서별 추출→매핑→이식, 수십 초 소요될 수 있습니다)\n")
+    n_total = len(present)
+    counter = {"n": 0}
+
+    def _progress(code, ok):
+        counter["n"] += 1
+        mark = "V" if ok else "X"
+        _line("  [%s] %-5s  (%d/%d)" % (mark, code, counter["n"], n_total))
+
     try:
         reports, comp = build_lead_all(
             settlement=settlement, registry=present, config_dir=str(CONFIG_DIR),
             template_root=str(TEMPLATE_DIR), output_dir=str(out_dir),
+            parsed_dir=str(PARSED_DIR / company),   # 변환자료/{회사명}/ — 출력조서와 분리
             params={"회사명": company, "날짜": date, "preparer": preparer, "reviewer": reviewer},
+            progress=_progress,
         )
     except PermissionError:
         _line(f"\n[오류] 출력 파일이 열려 있어 저장할 수 없습니다. 닫고 다시 실행해 주세요:\n       {out_dir}")
@@ -129,6 +143,20 @@ def main():
         for st, lv, m in r.entries:
             if lv in ("warn", "error"):
                 lines.append(f"      - [{st}] {m}")
+    # 미매핑 계정 리포트(금액·성격·귀속제안) — 정산표 계정 중 어느 조서에도 안 담긴 것.
+    # 제조원가명세서 항목은 제외(Q가 총계로 흡수). 귀속제안은 규칙기반(오프라인).
+    udetail = comp.get("unmapped_detail") or []
+    if udetail:
+        lines.append("")
+        lines.append(f"  ⚠ 미매핑 계정 {len(udetail)}건 — 어느 조서에도 안 담김(수동 확인·편입 필요):")
+        lines.append("      %-22s %18s  %-10s %s" % ("계정", "금액(수정후)", "성격", "귀속제안"))
+        lines.append("      " + "-" * 70)
+        for d in udetail:
+            lines.append("      %-22s %18s  %-10s %s" % (
+                str(d["계정"])[:22], format(int(d["금액"] or 0), ","), d["성격"], d["제안"]))
+    else:
+        lines.append("")
+        lines.append("  ✓ 미매핑 계정 없음(정산표 전 계정이 조서에 담김).")
     unmapped = comp.get("unmapped_adjustments") or []
     if unmapped:
         lines.append("")

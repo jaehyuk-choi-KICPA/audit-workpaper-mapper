@@ -63,8 +63,16 @@ def main(argv=None):
     print(f"소유 대분류 {comp['owned']}종")
     if comp["duplicate"]:
         print("⚠ 중복소유:", comp["duplicate"])
-    print(f"미매핑(아직 조서 없음) {len(comp['unmapped'])}종:")
-    print("  " + ", ".join(comp["unmapped"]))
+    ud = comp.get("unmapped_detail") or []
+    if ud:
+        print(f"\n⚠ 미매핑 계정 {len(ud)}종 — 어느 조서에도 안 담김(금액·성격·귀속제안):")
+        print("  %-22s %18s  %-10s %s" % ("계정", "금액(수정후)", "성격", "귀속제안"))
+        print("  " + "-" * 70)
+        for d in ud:
+            print("  %-22s %18s  %-10s %s" % (
+                str(d["계정"])[:22], format(int(d["금액"] or 0), ","), d["성격"], d["제안"]))
+    else:
+        print("미매핑 계정 없음(정산표 전 계정이 조서에 담김).")
     ua = comp.get("unmapped_adjustments") or []
     if ua:
         print(f"\n⚠ 미매핑 수정분개 {len(ua)}건 — 어느 조서에도 안 붙음(특수항목 등, 수동 확인):")

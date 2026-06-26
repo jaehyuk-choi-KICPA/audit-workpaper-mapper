@@ -108,6 +108,7 @@ def parse_trial_balance(path: str, sheet_name: str = _DEFAULT_SHEET) -> list[dic
     판관비_section = 매출_section = 매출원가_section = False
     유형자산_section = 무형자산_section = False
     재고_section = 자본_section = 영업외수익_section = 영업외비용_section = False
+    유동부채_section = 비유동부채_section = False
     for row in rows[header_idx + 1:]:
         대분류 = g(row, "대분류")
         계정명 = g(row, "계정명")
@@ -148,6 +149,15 @@ def parse_trial_balance(path: str, sheet_name: str = _DEFAULT_SHEET) -> list[dic
             자본_section = False
         elif _hdr and "자본" in nn:
             자본_section = True
+        # 부채: 'Ⅰ.유동부채'/'Ⅱ.비유동부채'~자본/부채총계 직전(매입채무·차입금·미지급금·충당부채 등).
+        # CC가 다른 부채조서(AA/BBDD/EE)가 안 가져간 '잔여 부채'를 유동/비유동 구분해 흡수(완전성·분개).
+        # '비유동부채'가 '유동부채'를 부분포함하므로 비유동을 먼저 본다.
+        if _hdr and ("자본" in nn or "부채총계" in nn or "부채와자본총계" in nn):
+            유동부채_section = 비유동부채_section = False
+        elif _hdr and "비유동부채" in nn:
+            비유동부채_section, 유동부채_section = True, False
+        elif _hdr and "유동부채" in nn:
+            유동부채_section, 비유동부채_section = True, False
         # 영업외수익/비용: Ⅵ.영업외수익~Ⅶ.영업외손실(비용)~법인세차감전. S가 통째로 렌더(2섹션).
         if _hdr and ("영업외손실" in nn or "영업외비용" in nn):
             영업외비용_section, 영업외수익_section = True, False
@@ -182,6 +192,9 @@ def parse_trial_balance(path: str, sheet_name: str = _DEFAULT_SHEET) -> list[dic
             "무형자산": 무형자산_section,
             "재고": 재고_section,
             "자본": 자본_section,
+            "유동부채": 유동부채_section,
+            "비유동부채": 비유동부채_section,
+            "부채": 유동부채_section or 비유동부채_section,
             "영업외수익": 영업외수익_section,
             "영업외비용": 영업외비용_section,
             "기초": 기초 if _is_amount(기초) else None,

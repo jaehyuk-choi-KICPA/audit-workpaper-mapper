@@ -10,6 +10,7 @@
 """
 
 import os
+import re
 import shutil
 import warnings
 from pathlib import Path
@@ -29,7 +30,7 @@ from generators import (
 # 별도정산표/수정사항 파서 버전 — 파서 코드가 바뀌면 올려 해시캐시를 무효화한다(소스 해시만으론
 # 못 잡음). build_a0·build_special·후처리 모두 이 상수를 써야 한다(하드코딩 금지 — 버전 드리프트로
 # 본문은 신캐시·후처리는 구캐시를 읽어 매칭이 어긋난 사건).
-_PARSER_VER = "v14"
+_PARSER_VER = "v15"
 
 
 class RunReport:
@@ -341,56 +342,99 @@ def _check_a0_form(path, info: dict, config_dir: str, config_file: str = "a0.yam
     return out
 
 
+def _account_nature(rec: dict) -> str:
+    """계정 성격(정산표 섹션 flag 기반). 미매핑 리포트 표시·귀속제안용."""
+    for flag, label in (("부채", "부채"), ("자본", "자본"), ("매출", "수익(매출)"),
+                        ("매출원가", "매출원가"), ("판관비", "판관비"),
+                        ("영업외수익", "영업외수익"), ("영업외비용", "영업외비용"),
+                        ("재고", "재고자산"), ("유형자산", "유형자산"), ("무형자산", "무형자산")):
+        if rec.get(flag):
+            return label
+    return "자산/기타"
+
+
+# 귀속제안 = 규칙(키워드) 기반 — 오프라인·결정적(LLM/임베딩 불필요; 프로젝트 원칙 일치).
+_SUGGEST_RULES = [
+    (("차입금", "사채", "유동성장기", "전환사채"), "BBDD(차입금)"),
+    (("매입채무", "외상매입금", "지급어음"), "AA(매입채무)"),
+    (("퇴직", "연금"), "EE(퇴직급여)"),
+    (("법인세",), "CC/법인세"),
+    (("충당", "미지급", "예수", "선수", "보증", "이연"), "CC(기타부채)"),
+    (("매출채권", "외상매출", "받을어음", "공사미수"), "C(매출채권)"),
+    (("미수", "선급", "대급금", "선납", "예치", "회원권"), "D(기타자산)"),
+    (("현금", "예금", "금융상품", "대여금"), "A-0(현금·금융)"),
+    (("매도가능", "지분법"), "B(유가증권)"),
+    (("상품", "제품", "원재료", "재공", "재고"), "E(재고자산)"),
+    (("자본금", "주식발행", "자기주식", "잉여금", "준비금", "평가이익", "평가손실", "재평가"), "GG(자본)"),
+    (("감가상각", "상각", "무형"), "G(유무형자산)"),
+]
+_NATURE_FALLBACK = {"부채": "CC(기타부채)", "자본": "GG(자본)", "수익(매출)": "P(매출)",
+                    "매출원가": "Q(매출원가)", "판관비": "R(판관비)", "영업외수익": "S(기타손익)",
+                    "영업외비용": "S(기타손익)", "재고자산": "E(재고자산)",
+                    "유형자산": "G(유무형자산)", "무형자산": "G(유무형자산)"}
+
+
+def _suggest_owner(name: str, nature: str) -> str:
+    n = re.sub(r"\s+", "", str(name or ""))
+    for kws, code in _SUGGEST_RULES:
+        if any(k in n for k in kws):
+            return code
+    return _NATURE_FALLBACK.get(nature, "수동확인")
+
+
 def routing_completeness(settlement, config_dir, config_files, *, parsed_dir=None):
     """정산표 전 대분류가 조서 config들에 1:1로 소유되는지 검사(중복·누락 안전망).
 
     Returns: {"unmapped":[대분류...], "duplicate":{대분류:[조서...]}, "owned":N}
     """
     from extractors import parse_trial_balance
+    from generators.adjust import owned_tokens, _norm
     import yaml
 
     tb = parse_trial_balance(settlement)
-    owned: dict = {}
+    # 조서별 소유 토큰을 adjust.owned_tokens로 통일 산출(엔진 groups/groups_flag+exclude_kw,
+    # refill/sales name_map 규칙·키워드, owns_flag(s), bs_rows, rows, owns 전부 반영).
+    # → 규칙·flag로 실제 렌더/흡수되는 계정이 '미매핑'으로 오표시되던 가짜 양성 제거.
+    cfgs = []
     for cf in config_files:
         cfg = yaml.safe_load((Path(config_dir) / cf).read_text(encoding="utf-8"))
-        sheet = cfg.get("sheet", cf)
-        # 엔진형: body.sections.groups (+ groups_flag=정산표 플래그로 동적 소유)
-        for sec in cfg.get("body", {}).get("sections", []):
-            for g in sec.get("groups", []):
-                owned.setdefault(g, []).append(sheet)
-            flag = sec.get("groups_flag")
-            if flag:
-                for r in tb:
-                    if r.get(flag):
-                        owned.setdefault(r["대분류"], []).append(sheet)
-        # 특수형(refill/capital): name_map의 문자열 target = 소유 대분류(규칙 dict은 제외 — 키워드 집계라 대분류 단정 불가)
-        for tgt in cfg.get("name_map", {}).values():
-            if isinstance(tgt, str):
-                owned.setdefault(tgt, []).append(sheet)
-        # 매출형(sales): is_groups 소유. + owns_flag(매출/매출원가 섹션)도 소유로 집계.
-        for g in cfg.get("is_groups", []):
-            owned.setdefault(g, []).append(sheet)
-        of = cfg.get("owns_flag")
-        if of:
-            for r in tb:
-                if r.get(of):
-                    owned.setdefault(r["대분류"], []).append(sheet)
-        # bs_rows: 매출형(P, is_groups 있음)은 교차참조라 제외, 그 외(EE 퇴직급여충당부채 등)는 주 소유.
-        if not cfg.get("is_groups"):
-            for spec in cfg.get("bs_rows", []):
-                owned.setdefault(spec["name"], []).append(sheet)
-        for spec in cfg.get("rows", []):        # 고정 다중행(B 등)
-            owned.setdefault(spec["name"], []).append(sheet)
-        for o in cfg.get("owns", []):           # 명시 소유(지분법 등)
-            owned.setdefault(o, []).append(sheet)
-        # 자본형(capital): name_map은 위에서 처리됨(자본 leaf=대분류).
+        cfgs.append((cfg.get("sheet", cf), owned_tokens(cfg, tb)))
+
+    def _owners(cls: str) -> list:
+        cn = _norm(cls)
+        out = []
+        for sheet, toks in cfgs:
+            if cn in toks["exact"] or any(len(k) >= 2 and k in cn for k in toks["kw"]):
+                out.append(sheet)
+        return sorted(set(out))
+
+    owned = {r["대분류"]: _owners(r["대분류"]) for r in tb}
     present = {r["대분류"] for r in tb
               if any(r.get(k) not in (None, 0) for k in ("기초", "기말", "수정후"))}
+    # 제조원가명세서 전용 대분류(그 대분류의 모든 행이 제조원가=True)는 완전성 체크 제외 —
+    # Q가 '당기총공사비용' 총계로 흡수하므로 개별 매핑 불필요(사용자 지시: 원가명세서쪽 미매핑 무시).
+    mfg_only = {c for c in present if all(r.get("제조원가") for r in tb if r["대분류"] == c)}
+    present -= mfg_only
+    unmapped = sorted(c for c in present if not owned.get(c))
+    # 미매핑 상세: 금액(수정후 우선, 없으면 기말 합)·성격·귀속제안(규칙기반). 리포트에 그대로 실음.
+    first = {}
+    amt = {}
+    for r in tb:
+        c = r["대분류"]
+        if c not in unmapped:
+            continue
+        first.setdefault(c, r)
+        amt[c] = amt.get(c, 0) + (r.get("수정후") if r.get("수정후") is not None else (r.get("기말") or 0))
+    detail = []
+    for c in unmapped:
+        nat = _account_nature(first.get(c, {}))
+        detail.append({"계정": c, "금액": amt.get(c, 0), "성격": nat,
+                       "제안": _suggest_owner(c, nat)})
     return {
-        "unmapped": sorted(present - set(owned)),
-        # 같은 조서가 groups+groups_flag로 중복 등록될 수 있어 시트 유니크 기준으로 판정.
-        "duplicate": {k: u for k, v in owned.items() if len(u := sorted(set(v))) > 1},
-        "owned": len(owned),
+        "unmapped": unmapped,
+        "unmapped_detail": detail,
+        "duplicate": {c: owned[c] for c in present if len(owned.get(c, [])) > 1},
+        "owned": sum(1 for c in present if owned.get(c)),
     }
 
 
@@ -534,8 +578,18 @@ def _apply_header_conclusion(path, sheet, cfg, params, has_adjust):
         ws[hc["reviewer"]] = params["reviewer"]
     if hc.get("날짜") and (params or {}).get("날짜"):
         ws[hc["날짜"]] = _coerce_date(params["날짜"])
-    if concl.get("cell"):
-        ws[concl["cell"]] = "수정사항 제외하고 특이사항 없음" if has_adjust else "특이사항 없음"
+    # 결론: 하드코딩 셀은 분개 행삽입으로 위치가 밀려 어긋난다(각주와 충돌). → **마지막 '결론' 헤더를
+    # 동적 탐지**해 그 2행 아래(텍스트 칸)에 쓴다. conclusion 키가 있는 조서만(특수구조 조서 제외 가능).
+    if concl:
+        text = "수정사항 제외하고 특이사항 없음" if has_adjust else "특이사항 없음"
+        last = None
+        for row in ws.iter_rows():
+            for cell in row:
+                v = cell.value
+                if isinstance(v, str) and "결론" in v and len(v.strip()) <= 10:
+                    last = (cell.row, cell.column)      # 마지막(최하단) '결론' 헤더 = 메인 결론
+        if last:
+            ws.cell(last[0] + 2, last[1]).value = text
     wb.save(path)
     wb.close()
 
@@ -558,8 +612,10 @@ def _light_cached(full, sheet, parsed, code):
 
 
 def build_lead_all(*, settlement, registry, config_dir, template_root, output_dir,
-                   params=None, parsed_dir=None):
+                   params=None, parsed_dir=None, progress=None):
     """레지스트리의 모든 총괄표를 완성본(보조시트·컨트롤 포함)에 채워 일괄 생성한다.
+
+    progress: 조서 1개 끝날 때마다 progress(code, ok:bool) 호출(실시간 진행표시용, 선택).
 
     조서별 흐름: **완성본에서 총괄표만 가벼운 템플릿으로 추출(_light_cached) → 그 위에 정산표
     데이터 생성(build_a0/build_special) → 수정사항 분개 렌더 → 헤더·결론 작성 → 완성본에
@@ -606,7 +662,9 @@ def build_lead_all(*, settlement, registry, config_dir, template_root, output_di
         code = item["code"]
         kind = item.get("kind", "engine")
         full = str(Path(template_root) / item["template"])
-        outp = str(out_dir / f"{code}{Path(full).suffix}")    # 완성본 확장자 유지(.xlsm 매크로 보존)
+        # 출력 파일명 = 템플릿명에서 'template' 토큰만 제거(예 C_4000_template_매출채권.xlsm → C_4000_매출채권.xlsm)
+        out_name = item["template"].replace("_template_", "_").replace("_template", "").replace("template_", "")
+        outp = str(out_dir / out_name)                          # 완성본 확장자 유지(.xlsm 매크로 보존)
         engine_configs.append(item["config"])
         cfg = _cfg(item)
         sheet = cfg["sheet"]
@@ -652,6 +710,11 @@ def build_lead_all(*, settlement, registry, config_dir, template_root, output_di
                     os.remove(gen)
                 except OSError:
                     pass
+        if progress:
+            try:
+                progress(code, not reports[code].has_error)
+            except Exception:
+                pass
 
     # 미매핑 분개(어느 조서에도 안 붙음) → 경고
     comp_adj = [(e["no"], [l["계정"] for l in e["lines"]]) for e in adj if e["no"] not in mapped]

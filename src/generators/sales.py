@@ -20,6 +20,8 @@ import openpyxl
 from openpyxl.styles import Border, Side
 from openpyxl.utils import column_index_from_string
 
+from .base import shift_formula_rows
+
 _NUMF = '#,##0;[Red]\\(#,##0\\);"-"'
 _PCTF = '0%;[Red]\\(0%\\)'
 
@@ -169,6 +171,7 @@ def fill_cogs(template, tb_rows, output, cfg):
     if cogs_row and types:
         n_rows = sum(_type_rows(cls) for _, cls, _ in types) + 1   # 종류들 + 최종 계
         ws.insert_rows(cogs_row + 1, n_rows)
+        shift_formula_rows(ws, cogs_row + 1, n_rows)   # 밀린 보존영역 수식 행참조 +n
         _underline(cogs_row)                        # 공사매출원가 아래 밑줄
         r = cogs_row + 1
         sum_rows = [cogs_row]
@@ -247,6 +250,7 @@ def fill_retirement(template, tb_rows, output, cfg):
     n_exp = 0
     if ins_row and exp:
         ws.insert_rows(ins_row, len(exp))
+        shift_formula_rows(ws, ins_row, len(exp))   # 밀린 보존영역 수식(PL표·체크행) 행참조 +n
         donor = ins_row + len(exp)            # 밀려난 원래 BS 행 = 도너
         for i in range(len(exp)):
             _copy_row_style(ws, donor, ins_row + i, ncols)
@@ -366,6 +370,7 @@ def fill_sales(template, tb_rows, output, cfg):
     delta = needed - avail
     if delta > 0:
         ws.insert_rows(is_start, delta)     # 데이터 행 삽입(합계·BS 아래로 밀림)
+        shift_formula_rows(ws, is_start, delta)   # 밀린 보존영역 수식 행참조 +n
         for i in range(delta):
             _copy_row_style(ws, is_start + delta, is_start + i, ncols)  # 도너=원래 첫 데이터행
         total_row += delta

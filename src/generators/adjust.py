@@ -37,9 +37,19 @@ def owned_tokens(cfg: dict, tb_rows: list) -> dict:
         exact.update(_norm(g) for g in sec.get("groups", []))
         flag = sec.get("groups_flag")
         if flag:
-            exact.update(_norm(r["대분류"]) for r in tb_rows if r.get(flag))
-    of = cfg.get("owns_flag")           # 손익 섹션(매출/매출원가)의 대분류+계정명을 정확 토큰으로
-    if of:
+            excl = [_norm(x) for x in sec.get("exclude_kw", [])]   # 타 조서 소유분 제외(CC 잔여부채 등)
+            for r in tb_rows:
+                if not r.get(flag):
+                    continue
+                kn = _norm(r["대분류"])
+                if any(e and e in kn for e in excl):
+                    continue
+                exact.add(kn)
+    # owns_flag(단일)/owns_flags(복수): 그 flag 섹션의 대분류+계정명을 정확 토큰으로(매출·매출원가·원가상세·제조 등)
+    ofs = list(cfg.get("owns_flags", []))
+    if cfg.get("owns_flag"):
+        ofs.append(cfg["owns_flag"])
+    for of in ofs:
         for r in tb_rows:
             if r.get(of):
                 exact.add(_norm(r["대분류"])); exact.add(_norm(r["계정명"]))
@@ -124,26 +134,57 @@ def render(path: str, sheet: str, entries: list, *, header_kw="수정사항",
     n_lines = sum(len(e["lines"]) for e in entries)
     n_rows = 1 + n_lines + (2 + len(foots) if foots else 0) if entries else 0  # 헤더+라인+(빈행+각주)
 
-    # 기존 수정사항 분개 잔재(템플릿 격자·서브헤더) 제거: 다음 'N.' 섹션(주석검토/결론 등) 전까지
-    # 값을 비운다(타 회사 완성본 분개가 남는 것 방지 — 관련 분개 없는 회사의 A-0에 타사 분개 잔재 등).
-    # 섹션 헤더는 'N.'(점), 서브헤더는 'N)'(괄호)라 점-접두만 다음 섹션으로 본다.
+    # ── 다음 섹션 경계(next_sec) robust 탐지 ──────────────────────────────
+    # 근본문제: 템플릿이 분개용으로 예약한 고정공간에 의존하면, 분개가 작을 땐 잉여행의 격자(테두리)가
+    # 남아 표가 커 보이고 아래 '주석/증감분석' 위에 그려진 듯 보인다. → 예약공간 의존을 버리고
+    # [분개헤더, 다음섹션) 영역을 '데이터 크기에 정확히' 맞춘다(양방향). 먼저 경계를 정확히 잡는다.
+    #   종료 인식: 'N.'(섹션) · 'N)'(서브헤더) · 키워드(주석/증감분석/결론/Recap/Test/Nature/검토).
+    # 경계 = 다음 **메인 섹션**('N.' 점접두)만. 'N)' 괄호접두는 수정사항 내부 서브섹션
+    # (예 '2) 검토 결과')이라 경계로 보면 그 아래 placeholder를 못 지운다 → 제외.
+    # 키워드(결론/주석 등)는 'N.'가 없는 비표준 헤더 대비, 짧은 헤더형 셀에서만 보조 인정.
+    _SEC_KW = ("주석", "증감분석", "결론", "recap", "nature")
+
+    def _is_next_section(rr):
+        for c in range(1, 10):
+            raw = ws.cell(rr, c).value
+            v = _norm(raw)
+            if not v:
+                continue
+            if re.match(r"^[0-9０-９Ⅰ-Ⅻ]+\)", v):       # 'N)' 서브섹션('2) 결론' 등) → 경계 아님(스킵)
+                continue
+            if re.match(r"^[0-9０-９Ⅰ-Ⅻ]+\.", v):       # 'N.' 메인 섹션 → 경계
+                return True
+            if len(str(raw).strip()) <= 14 and any(k in v.lower() for k in _SEC_KW):
+                return True                              # 'N.' 없는 메인 헤더(예 P의 '결론') 보조 인식
+        return False
+
     next_sec = ws.max_row + 1
-    for rr in range(hr + 1, ws.max_row + 1):
-        if any(re.match(r"^[0-9０-９Ⅰ-Ⅻ]+\.", _norm(ws.cell(rr, c).value)) for c in range(1, 9)):
+    for rr in range(hr + 2, ws.max_row + 1):       # hr+1은 보통 빈 줄, hr+2부터 탐색
+        if _is_next_section(rr):
             next_sec = rr
             break
-    # ① 렌더 구간과 겹치는 병합 먼저 해제(분개격자 병합 잔재 — 쓰기/언머지 충돌 방지). ② 값 비움.
+
+    # ── 영역 완전 정규화: [hr+1, next_sec) 의 값·테두리·채움·병합 전부 초기화 ──
+    # (값만 지우던 과거 버그 → 예약 격자 잔존. 이제 테두리/채움까지 비워 잉여행이 빈칸이 되게 한다.)
     from openpyxl.worksheet.cell_range import CellRange
-    upper = next_sec + n_rows
+    from openpyxl.styles import Border as _B, PatternFill as _PF
     for ref in [str(m) for m in ws.merged_cells.ranges]:
         rng = CellRange(ref)
-        if rng.min_row <= upper and rng.max_row >= hr + 1:
+        if rng.min_row < next_sec and rng.max_row >= hr + 1:
             ws.unmerge_cells(ref)
-    for rr in range(hr + 1, next_sec):
-        for c in range(1, ws.max_column + 1):
-            ws.cell(rr, c).value = None
+    _blank_b, _blank_f = _B(), _PF()
 
-    # 관련 분개 없음 → 잔재 비우고 '해당사항 없음'만 남김(타사 격자 잔재 제거).
+    def _normalize(r0, r1):
+        for rr in range(r0, r1):
+            for c in range(1, ws.max_column + 1):
+                cell = ws.cell(rr, c)
+                cell.value = None
+                cell.border = _blank_b
+                cell.fill = _blank_f
+
+    _normalize(hr + 1, next_sec)
+
+    # 관련 분개 없음 → '해당사항 없음'만(영역은 위에서 완전 정규화됨 → 잔존 격자 0).
     if not entries:
         ws.cell(hr + 2, hc).value = "해당사항 없음"
         wb.save(path)
@@ -151,8 +192,9 @@ def render(path: str, sheet: str, entries: list, *, header_kw="수정사항",
 
     start = hr + 2                                              # 섹션 헤더 아래 한 행 띄고
     avail = max(0, next_sec - start)                           # 다음 섹션 전까지 빈 공간
-    if n_rows > avail:
+    if n_rows > avail:                                          # 데이터가 더 크면 그만큼 삽입(아래로 밀어냄)
         ws.insert_rows(start, n_rows - avail)
+    # (데이터가 더 작으면: 잉여행은 위에서 정규화돼 빈칸 → 표가 정확히 entries 크기만큼만 보임)
 
     c0 = hc
     cols = {"no": c0, "acct": c0 + 1, "dr": c0 + 2, "cr": c0 + 3, "desc": c0 + 4}

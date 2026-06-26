@@ -12,8 +12,13 @@
 
 import re
 from collections import defaultdict
+from copy import copy
+from pathlib import Path
 
 import openpyxl
+from openpyxl.utils import column_index_from_string, get_column_letter
+
+from .base import shift_formula_rows
 
 _ROMAN = ("Ⅰ", "Ⅱ", "Ⅲ", "Ⅳ", "Ⅴ", "Ⅵ")
 _NUMF = '#,##0;[Red]\\(#,##0\\);"-"'
@@ -21,6 +26,123 @@ _NUMF = '#,##0;[Red]\\(#,##0\\);"-"'
 
 def _norm(s) -> str:
     return re.sub(r"\s+", "", str(s)) if s is not None else ""
+
+
+def _copy_style(ws, src_r, dst_r, ncols):
+    for c in range(1, ncols + 1):
+        sc = ws.cell(src_r, c)
+        if sc.has_style:
+            dc = ws.cell(dst_r, c)
+            dc.font = copy(sc.font); dc.border = copy(sc.border)
+            dc.fill = copy(sc.fill); dc.alignment = copy(sc.alignment)
+            dc.number_format = sc.number_format
+
+
+def _fill_capital_roman(template, tb_rows, adj_entries, output, cfg, roman_groups):
+    """로마자 분류 그룹핑 방식(사용자 지정): 자본 flag 계정을 로마자(Ⅰ~Ⅴ)에 매칭해 그 아래
+    leaf로 동적 렌더(누락 계정 자동 편입). leaf 라벨에 의존하지 않는다. 로마자 SUM은 멤버로 재작성,
+    자본총계 등 절대참조는 행삽입 시 shift_formula_rows로 보정. 로마자 처리는 **아래→위**(삽입이
+    위쪽 로마자 위치에 영향 없게)."""
+    sheet = cfg["sheet"]
+    nci = cfg.get("name_col", 2)
+    bcol = cfg.get("base_col", "C")
+    ecol = cfg.get("end_col", "D")
+    acol = cfg.get("adj_col", "G")
+    hr = cfg.get("header_row", 9)
+    end_anchor = _norm(cfg.get("data_end_anchor", "자본총계"))
+
+    # 자본 flag 대분류 집계(정산표 순서 유지)
+    order, agg = [], {}
+    for rec in tb_rows:
+        if not rec.get("자본"):
+            continue
+        kn = _norm(rec["대분류"])
+        if kn not in agg:
+            agg[kn] = {"name": rec["대분류"], "기초": 0, "기말": 0}
+            order.append(kn)
+        agg[kn]["기초"] += rec["기초"] or 0
+        agg[kn]["기말"] += rec["기말"] or 0
+
+    def cat_of(kn):
+        for roman_kw, kws in roman_groups.items():     # 위에서부터 먼저 매칭(특수→일반)
+            if any(_norm(x) in kn for x in kws):
+                return roman_kw
+        return None
+
+    members = {rk: [] for rk in roman_groups}
+    for kn in order:
+        c = cat_of(kn)
+        if c:
+            members[c].append(agg[kn])
+
+    re_adj = sum(l["이익잉여금"] for e in adj_entries for l in e["lines"] if l.get("이익잉여금"))
+
+    wb = openpyxl.load_workbook(template)
+    ws = wb[sheet]
+    ncols = ws.max_column
+
+    # 로마자 행과 각 leaf 영역 [로마자+1, 다음 로마자) 파악
+    roman_rows = []
+    for r in range(hr + 1, ws.max_row + 1):
+        c = _norm(ws.cell(r, nci).value)
+        if not c:
+            continue
+        if c.startswith(end_anchor):
+            break
+        if c[:1] in _ROMAN:
+            cat = next((rk for rk in roman_groups if _norm(rk) in c), None)
+            roman_rows.append((r, cat))
+    bounds = []
+    for i, (rr, cat) in enumerate(roman_rows):
+        nxt = roman_rows[i + 1][0] if i + 1 < len(roman_rows) else None
+        if nxt is None:
+            te = rr + 1
+            while te <= ws.max_row and not _norm(ws.cell(te, nci).value).startswith(end_anchor):
+                te += 1
+            nxt = te
+        bounds.append((rr, cat, rr + 1, nxt))      # leaf 영역 [rr+1, nxt)
+
+    n_filled = 0
+    for rr, cat, ls, le in reversed(bounds):        # 아래→위
+        mem = members.get(cat, []) if cat else []
+        avail = le - ls
+        need = max(len(mem), 1)                      # 최소 1행(빈 분류도 leaf 1행 유지)
+        if need > avail:
+            ins = need - avail
+            ws.insert_rows(le, ins)
+            shift_formula_rows(ws, le, ins)         # 자본총계 등 절대참조 보정
+            for k in range(ins):
+                _copy_style(ws, ls, le + k, ncols)  # 도너=기존 첫 leaf
+            le += ins
+        r = ls
+        for m in mem:
+            ws.cell(r, nci).value = m["name"]
+            ws[f"{bcol}{r}"] = m["기초"]; ws[f"{bcol}{r}"].number_format = _NUMF
+            ws[f"{ecol}{r}"] = m["기말"]; ws[f"{ecol}{r}"].number_format = _NUMF
+            if "미처분이익잉여금" in _norm(m["name"]) and re_adj:
+                ws[f"{acol}{r}"] = re_adj; ws[f"{acol}{r}"].number_format = _NUMF
+            else:
+                ws[f"{acol}{r}"] = None
+            n_filled += 1
+            r += 1
+        for rb in range(r, le):                     # 잉여 leaf 비움(값·라벨)
+            ws.cell(rb, nci).value = None
+            ws[f"{bcol}{rb}"] = None; ws[f"{ecol}{rb}"] = None; ws[f"{acol}{rb}"] = None
+        last = r - 1 if mem else ls                  # SUM 범위 끝
+        if mem:
+            ws[f"{bcol}{rr}"] = f"=SUM({bcol}{ls}:{bcol}{last})"
+            ws[f"{ecol}{rr}"] = f"=SUM({ecol}{ls}:{ecol}{last})"
+        else:
+            ws[f"{bcol}{rr}"] = 0; ws[f"{ecol}{rr}"] = 0
+        ws[f"{bcol}{rr}"].number_format = _NUMF
+        ws[f"{ecol}{rr}"].number_format = _NUMF
+
+    for col in (bcol, ecol, "E", acol, "H"):
+        cur = ws.column_dimensions[col].width or 0
+        ws.column_dimensions[col].width = max(cur, 16)
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output)
+    return {"n_filled": n_filled, "re_adj": re_adj, "mode": "roman"}
 
 
 def _common_prefix(a: str, b: str) -> int:
@@ -37,7 +159,12 @@ def fill_capital(template: str, tb_rows: list, adj_entries: list, output: str, c
     """자본 총괄표를 정산표로 in-place 리필한다.
 
     cfg: {sheet, header_row, data_end_anchor, name_col, base_col, end_col, adj_col}
+    roman_groups가 있으면 로마자 분류 그룹핑 방식(_fill_capital_roman)으로 동적 렌더(누락 계정 편입).
     """
+    roman_groups = cfg.get("roman_groups")
+    if roman_groups:
+        return _fill_capital_roman(template, tb_rows, adj_entries, output, cfg, roman_groups)
+
     sheet = cfg["sheet"]
     nci = cfg.get("name_col", 2)        # 계정명 열(1-indexed)
     bcol = cfg.get("base_col", "C")     # 기초
