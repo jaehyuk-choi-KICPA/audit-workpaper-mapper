@@ -2,6 +2,7 @@
 
 import datetime as _dt
 import json
+import re
 from hashlib import sha256
 from pathlib import Path
 from typing import Callable
@@ -10,6 +11,27 @@ from typing import Callable
 def file_hash(path: str) -> str:
     """파일 내용의 SHA-256 앞 16자리. 내용이 바뀌면 해시도 바뀐다."""
     return sha256(Path(path).read_bytes()).hexdigest()[:16]
+
+
+def _prune_old_caches(cdir: Path, stem: str, label: str, keep: Path) -> None:
+    """같은 소스(stem)·같은 파서(label, 버전접미 제거)인 **옛 캐시**(다른 버전/해시)를 삭제한다.
+    파서 버전(_vN)을 올리거나 원본이 바뀌면 새 파일이 생기는데, 옛 파일을 안 지우면 누적돼
+    JSON 인덱싱(에디터)·디스크를 잡아먹는다. 'keep'(현재 파일)만 남긴다.
+
+    해시(16 hex)까지 매칭해 'bank'가 'bank_loans'를 잘못 지우는 접두 충돌을 막는다.
+    """
+    fam = re.sub(r"_v\d+$", "", label)              # 버전 접미 제거(trial_balance_v9 → trial_balance)
+    h = r"[0-9a-f]{8,}"
+    pats = [re.compile(rf"^{re.escape(stem)}__{re.escape(fam)}_v\d+_{h}\.json$"),  # 버전형(모든 버전)
+            re.compile(rf"^{re.escape(stem)}__{re.escape(fam)}_{h}\.json$")]       # 무버전 base
+    for old in cdir.glob(f"{stem}__*.json"):
+        if old.name == keep.name:
+            continue
+        if any(p.match(old.name) for p in pats):
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +89,10 @@ def load_with_cache(path: str, parse_fn: Callable, *,
     cdir.mkdir(parents=True, exist_ok=True)
 
     label = tag or getattr(parse_fn, "__name__", "parse")
-    cache_file = cdir / f"{Path(path).stem}__{label}_{file_hash(path)}.json"
+    stem = Path(path).stem
+    cache_file = cdir / f"{stem}__{label}_{file_hash(path)}.json"
+
+    _prune_old_caches(cdir, stem, label, cache_file)   # 옛 버전/해시 캐시 자동 정리(누적 방지)
 
     if cache_file.exists():
         try:
@@ -113,6 +138,14 @@ def cached_ideal_ledger(source_path: str, parsed_dir: str, config_dir: str) -> l
     out_dir = Path(parsed_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cached = out_dir / f"{src.stem}__ideal_{file_hash(source_path)}.xlsx"
+
+    # 소스가 바뀌면 옛 해시 변환물(.xlsx)이 남아 누적 → 현재 것만 두고 정리.
+    for old in out_dir.glob(f"{src.stem}__ideal_*.xlsx"):
+        if old.name != cached.name:
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
     if cached.exists():
         return read_ideal_ledger(str(cached))

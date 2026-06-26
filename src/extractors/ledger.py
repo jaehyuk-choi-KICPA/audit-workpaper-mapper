@@ -3,11 +3,14 @@
 회사마다 ERP 출력 형태가 다르므로 시트명 패턴으로 형식을 감지한 뒤
 이상적 헤더로 변환한다.
 
-지원 형식 (시트명 패턴으로 자동 감지):
+지원 형식 (시트명 패턴 → 없으면 계정과목 컬럼으로 자동 감지):
   num_name_code  시트명 `N_계정명(코드)`  예: `0_보통예금(10300)`, `9_장기금융상품(17600)`
                  헤더: 코드|거래처명|전기(월)이월|증가|감소|잔액  (데이터 col0~)
   code_name      시트명 `(코드)계정명`     예: `(0103)보통예금`
                  헤더: 코드|거래처명|전기(월)이월|차변|대변|잔액   (데이터 col2~)
+  account_col    단일/통합 시트(계정별 분리 안 됨, 예 '명세서') — 계정과목이 **행 컬럼**으로 존재.
+                 헤더: 거래처코드|거래처|코드|계정과목명|전기(월)이월|차변|대변|잔액
+                 사실상 이미 변환된 '거래처원장 총괄잔액' 출력. 시트명 패턴이 안 맞을 때 폴백.
 
 출력 이상적 헤더:
   계정과목 | 적요 | 거래처명 | 전기이월 | 차변/증가 | 대변/감소 | 잔액 | 비고
@@ -45,6 +48,7 @@ _SYNONYMS: dict[str, str] = {
     "전기(월)이월": "전기이월",
     "전기이월":     "전기이월",
     "거래처명":     "거래처명",
+    "거래처":       "거래처명",   # '거래처'(이름)를 fuzzy가 '거래처코드'로 오인하지 않게 exact로 고정
     "증가":         "차변/증가",
     "차변":         "차변/증가",
     "감소":         "대변/감소",
@@ -52,9 +56,19 @@ _SYNONYMS: dict[str, str] = {
     "잔액":         "잔액",
 }
 
-# 계정과목은 시트명에서만 도출하므로 동의어에 포함하지 않는다 (의도적).
+# 다중시트 형식에선 계정과목을 시트명에서만 도출한다(의도적). 단일/통합 시트(account_col)
+# 형식에선 계정과목이 행 컬럼으로 존재하므로 아래 _SYNONYMS_ACCT로 그 컬럼을 인식한다.
+_SYNONYMS_ACCT: dict[str, str] = {
+    **_SYNONYMS,
+    "계정과목":   "계정과목",
+    "계정과목명": "계정과목",
+    "계정":       "계정과목",
+}
 
 _REQUIRED = {"코드", "거래처명", "전기이월", "차변/증가", "대변/감소", "잔액"}
+
+# account_col 형식은 계정과목 컬럼이 추가로 필수.
+_REQUIRED_ACCT = _REQUIRED | {"계정과목"}
 
 # 부분일치(fuzzy) 폴백용 키워드 — 정확매칭으로 못 찾은 필수 컬럼만 보강한다.
 # 헤더 라벨이 ERP마다 조금씩 달라도(예: '기말잔액', '거 래 처', '당기증가') 흡수.
@@ -66,6 +80,12 @@ _SUB_KEYWORDS: list[tuple] = [
     ("차변/증가", ["차변", "증가", "입금"]),
     ("대변/감소", ["대변", "감소", "출금"]),
     ("잔액",      ["잔액", "기말"]),
+]
+
+# account_col 폴백용: 위 키워드 + 계정과목. 계정과목은 '거래처코드'·'코드'보다 뒤에 와도
+# 무방하나(정확매칭이 코드를 먼저 점유), 구체적 라벨 우선 위해 별도 키워드를 둔다.
+_SUB_KEYWORDS_ACCT: list[tuple] = _SUB_KEYWORDS + [
+    ("계정과목", ["계정과목", "계정", "과목"]),
 ]
 
 _TOTAL_MARKERS = {"합계"}  # _normalize 후 비교하므로 '합 계'도 매칭됨
@@ -197,6 +217,43 @@ def _parse_sheet(get_row, nrows: int, account: str, sheet_name: str) -> list[dic
     return result
 
 
+def _parse_account_col(sheets: list) -> list[dict]:
+    """단일/통합 시트(계정과목이 행 컬럼) 폴백 파싱. 시트명 패턴이 안 맞을 때만 호출된다.
+
+    계정과목을 **시트명이 아니라 행의 계정과목 컬럼**에서 도출한다. 이 형식은 ERP의
+    '거래처원장 총괄잔액' 기계 출력(수기 병합본이 아님)이라 컬럼을 신뢰할 수 있다 —
+    다중시트 형식의 '시트명만' 규칙(수기 병합 오류 방지)의 정당한 예외.
+
+    sheets: [(시트명, get_row, nrows), ...]. 헤더가 매핑되는 시트만 사용(표지 등 무시).
+    """
+    out: list[dict] = []
+    for name, get_row, nrows in sheets:
+        found = None
+        for i in range(min(12, nrows)):
+            cm = map_headers(get_row(i), synonyms=_SYNONYMS_ACCT, required=_REQUIRED_ACCT,
+                             sub_keywords=_SUB_KEYWORDS_ACCT, parser_key="ledger")
+            if cm is not None:
+                found = (i, cm)
+                break
+        if found is None:
+            continue
+        header_idx, col_map = found
+        c_acct = col_map["계정과목"]
+        c_code = col_map["코드"]
+        c_name = col_map["거래처명"]
+        for r in range(header_idx + 1, nrows):
+            row = get_row(r)
+            if all(v is None or str(v).strip() == "" for v in row):
+                continue
+            if _is_total(row, c_code, c_name):
+                continue
+            acct = row[c_acct] if c_acct < len(row) else None
+            if acct is None or str(acct).strip() == "":   # 계정과목 없는 행=소계/공백
+                continue
+            out.append(_to_record(row, str(acct).strip(), col_map))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 검증 게이트
 # ---------------------------------------------------------------------------
@@ -214,13 +271,16 @@ def _validate_result(rows: list[dict], path: str) -> None:
         if bal is None:
             continue
         try:
-            diff = abs(float(prev) + float(dr) - float(cr) - float(bal))
+            # 부호 무관: 자산형(기초+차변-대변=잔액)·부채/자본/수익형(기초+대변-차변=잔액) 중
+            # 하나만 맞으면 정상. 총괄잔액(account_col)은 계정유형이 섞여 있어 필수.
+            p, d, c, b = float(prev), float(dr), float(cr), float(bal)
+            diff = min(abs(p + d - c - b), abs(p + c - d - b))
         except (TypeError, ValueError):
             continue
         if diff > 1:
             errors.append(
                 f"  거래처 '{r['거래처명']}' ({r['계정과목']}): "
-                f"전기이월{prev}+차변{dr}-대변{cr}≠잔액{bal} (차이={diff:.0f})"
+                f"전기이월{prev}±차변{dr}∓대변{cr}≠잔액{bal} (차이={diff:.0f})"
             )
 
     if errors:
@@ -251,38 +311,39 @@ def parse_ledger(path: str) -> list[dict]:
     ext = p.suffix.lower()
     rows: list[dict] = []
 
+    # ① 시트 접근자 [(시트명, get_row, nrows)]를 형식 무관하게 한 번에 수집.
+    sheets: list = []
     if ext == ".xls":
         if not _HAS_XLRD:
             raise ImportError(".xls 처리에는 xlrd가 필요합니다: pip install xlrd")
         wb = xlrd.open_workbook(str(p))
         names = wb.sheet_names()
-        fmt = _detect_format(names)
-        if fmt == "unknown":
-            raise ValueError(f"[거래처잔액 파서] 시트명 형식 미인식: {names[:5]}")
         for name in names:
-            account = _account_name(name, fmt)
-            if account is None:
-                continue  # 형식 패턴에 맞지 않는 시트(표지·요약 등) 건너뜀
             sh = wb.sheet_by_name(name)
-            rows.extend(_parse_sheet(sh.row_values, sh.nrows, account, name))
-
+            sheets.append((name, sh.row_values, sh.nrows))
     elif ext in (".xlsx", ".xlsm"):
         wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
         names = wb.sheetnames
-        fmt = _detect_format(names)
-        if fmt == "unknown":
-            wb.close()
-            raise ValueError(f"[거래처잔액 파서] 시트명 형식 미인식: {names[:5]}")
         for name in names:
-            account = _account_name(name, fmt)
-            if account is None:
-                continue
             data = list(wb[name].iter_rows(values_only=True))
-            rows.extend(_parse_sheet(lambda i: list(data[i]), len(data), account, name))
+            # 기본인자로 data 바인딩(루프 변수 늦은바인딩 방지).
+            sheets.append((name, lambda i, d=data: list(d[i]), len(data)))
         wb.close()
-
     else:
         raise ValueError(f"지원하지 않는 파일 형식: {ext}")
+
+    # ② 시트명 패턴(다중시트, 계정=시트명) 우선. 없으면 계정과목 컬럼(account_col) 폴백.
+    fmt = _detect_format(names)
+    if fmt != "unknown":
+        for name, get_row, nrows in sheets:
+            account = _account_name(name, fmt)
+            if account is None:
+                continue  # 형식 패턴에 맞지 않는 시트(표지·요약 등) 건너뜀
+            rows.extend(_parse_sheet(get_row, nrows, account, name))
+    else:
+        rows = _parse_account_col(sheets)   # 단일/통합 시트(계정과목이 행 컬럼)
+        if not rows:
+            raise ValueError(f"[거래처잔액 파서] 시트명 형식·계정과목 컬럼 모두 미인식: {names[:5]}")
 
     _validate_result(rows, str(p))
     return rows

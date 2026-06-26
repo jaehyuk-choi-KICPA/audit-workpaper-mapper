@@ -9,6 +9,7 @@
 무시(감사인 수행영역): FN·월보 시트, 은행연합회 자료 열, 우편조회 회신금액.
 """
 
+import os
 import shutil
 import warnings
 from pathlib import Path
@@ -24,6 +25,11 @@ from generators import (
     A300Generator, build_a300_data,
     ControlSheetGenerator, build_ref_map,
 )
+
+# 별도정산표/수정사항 파서 버전 — 파서 코드가 바뀌면 올려 해시캐시를 무효화한다(소스 해시만으론
+# 못 잡음). build_a0·build_special·후처리 모두 이 상수를 써야 한다(하드코딩 금지 — 버전 드리프트로
+# 본문은 신캐시·후처리는 구캐시를 읽어 매칭이 어긋난 사건).
+_PARSER_VER = "v14"
 
 
 class RunReport:
@@ -254,7 +260,7 @@ def build_a0(*, settlement, template, config_dir, output, params=None, parsed_di
     report = RunReport()
 
     # 캐시 태그에 파서 버전을 포함 → 파서 코드가 바뀌면 캐시가 자동 무효화(소스 해시만으론 못 잡음).
-    _PARSER_VER = "v3"
+
 
     def _cached(fn, src, tag):
         return load_with_cache(src, fn, cache_dir=parsed, tag=f"{tag}_{_PARSER_VER}")
@@ -308,7 +314,8 @@ def _check_a0_form(path, info: dict, config_dir: str, config_file: str = "a0.yam
     from openpyxl.utils import column_index_from_string
     import yaml
 
-    cfg = yaml.safe_load((Path(config_dir) / config_file).read_text(encoding="utf-8"))
+    from generators.base import apply_col_offset
+    cfg = apply_col_offset(yaml.safe_load((Path(config_dir) / config_file).read_text(encoding="utf-8")))
     sheet = cfg["sheet"]
     b = cfg["body"]
     cols = b["columns"]
@@ -317,7 +324,11 @@ def _check_a0_form(path, info: dict, config_dir: str, config_file: str = "a0.yam
     # 리터럴 값 열(계정명/기초/기말/수정사항)만 너비검사(수식열은 텍스트길이 오탐 제외)
     lit = [cols[k] for k in ("계정명", "기초", "기말", "수정사항") if k in cols]
     lit_ci = [column_index_from_string(c) for c in lit]
-    grid_ci = sorted(set(lit_ci + [column_index_from_string(c) for c in b.get("num_cols", [])]))
+    # 격자검사 대상 = 채우는 열(num_cols) − grid_skip(템플릿상 의도적으로 비고 테두리 없는 이동열,
+    #   예: G 유형자산의 취득·처분·감가상각 컬럼). skip은 빈 이동컬럼 오탐 방지.
+    skip = set(b.get("grid_skip", []))
+    num = [c for c in b.get("num_cols", []) if c not in skip]
+    grid_ci = sorted(set(lit_ci + [column_index_from_string(c) for c in num]))
     out = []
     out += validate_grid(path, sheet, header_row=hr, data_start=ds,
                          n_rows=de - ds + 1, cols=grid_ci)
@@ -356,9 +367,23 @@ def routing_completeness(settlement, config_dir, config_files, *, parsed_dir=Non
         for tgt in cfg.get("name_map", {}).values():
             if isinstance(tgt, str):
                 owned.setdefault(tgt, []).append(sheet)
-        # 매출형(sales): is_groups만 소유. bs_rows는 교차참조(주 소유는 C/AA)라 소유로 안 침.
+        # 매출형(sales): is_groups 소유. + owns_flag(매출/매출원가 섹션)도 소유로 집계.
         for g in cfg.get("is_groups", []):
             owned.setdefault(g, []).append(sheet)
+        of = cfg.get("owns_flag")
+        if of:
+            for r in tb:
+                if r.get(of):
+                    owned.setdefault(r["대분류"], []).append(sheet)
+        # bs_rows: 매출형(P, is_groups 있음)은 교차참조라 제외, 그 외(EE 퇴직급여충당부채 등)는 주 소유.
+        if not cfg.get("is_groups"):
+            for spec in cfg.get("bs_rows", []):
+                owned.setdefault(spec["name"], []).append(sheet)
+        for spec in cfg.get("rows", []):        # 고정 다중행(B 등)
+            owned.setdefault(spec["name"], []).append(sheet)
+        for o in cfg.get("owns", []):           # 명시 소유(지분법 등)
+            owned.setdefault(o, []).append(sheet)
+        # 자본형(capital): name_map은 위에서 처리됨(자본 leaf=대분류).
     present = {r["대분류"] for r in tb
               if any(r.get(k) not in (None, 0) for k in ("기초", "기말", "수정후"))}
     return {
@@ -387,7 +412,7 @@ def build_special(*, kind, settlement, template, config_dir, config_file, output
     out = Path(output)
     parsed = parsed_dir or str(out.parent / "변환자료")
     report = RunReport()
-    _PARSER_VER = "v3"
+
 
     def _cached(fn, src, tag):
         return load_with_cache(src, fn, cache_dir=parsed, tag=f"{tag}_{_PARSER_VER}")
@@ -399,7 +424,8 @@ def build_special(*, kind, settlement, template, config_dir, config_file, output
         tb_rows = []
         report.add("입력", "error", f"별도정산표 처리 실패({type(e).__name__}: {e})")
 
-    cfg = yaml.safe_load((cfg_dir / config_file).read_text(encoding="utf-8"))
+    from generators.base import apply_col_offset
+    cfg = apply_col_offset(yaml.safe_load((cfg_dir / config_file).read_text(encoding="utf-8")))
     work = str(out)
     shutil.copy(template, work)
     try:
@@ -416,6 +442,12 @@ def build_special(*, kind, settlement, template, config_dir, config_file, output
         elif kind == "sales":
             from generators.sales import fill_sales
             res = fill_sales(work, tb_rows, work, cfg)
+        elif kind == "retirement":
+            from generators.sales import fill_retirement
+            res = fill_retirement(work, tb_rows, work, cfg)
+        elif kind == "rows":
+            from generators.refill import fill_rows
+            res = fill_rows(work, tb_rows, work, cfg)
         else:
             raise ValueError(f"알 수 없는 kind: {kind}")
         report.add("생성", "ok", f"{cfg.get('sheet')} 생성 {res}")
@@ -443,6 +475,9 @@ def _check_special_form(path, cfg: dict) -> list:
 
     sheet = cfg["sheet"]
     val_cols = [cfg[k] for k in ("base_col", "end_col", "adj_col") if cfg.get(k)]
+    for spec in cfg.get("rows", []):            # 고정 다중행(B): 행별 컬럼
+        val_cols += [spec[k] for k in ("base_col", "end_col", "adj_col") if spec.get(k)]
+    val_cols = list(dict.fromkeys(val_cols))
     wb = openpyxl.load_workbook(path)
     ws = wb[sheet]
     issues = []
@@ -460,34 +495,166 @@ def _check_special_form(path, cfg: dict) -> list:
     return issues
 
 
+def _coerce_date(v):
+    """입력 날짜 문자열을 datetime으로(셀 날짜서식 유지). 파싱 실패 시 원문 문자열."""
+    if hasattr(v, "year"):           # 이미 date/datetime
+        return v
+    s = str(v).strip()
+    for fmt in ("%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            from datetime import datetime
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return s
+
+
+def _apply_header_conclusion(path, sheet, cfg, params, has_adjust):
+    """생성본(gen, 1회용)에 상단 헤더(회사명/Preparer/Reviewer/날짜)와 결론 문구를 쓴다.
+
+    회사명은 'label: 값' 결합형이라 라벨을 보존하며 값만 교체. 결론은 수정사항 유무로 하드코딩
+    ('수정사항 제외하고 특이사항 없음' / '특이사항 없음'). openpyxl로 gen(1회용)에만 적용 →
+    완성본 컨트롤엔 영향 없음(이식으로 총괄표만 옮겨감)."""
+    import openpyxl
+    hc = cfg.get("header_cells") or {}
+    concl = cfg.get("conclusion") or {}
+    if not hc and not concl:
+        return
+    wb = openpyxl.load_workbook(path)
+    ws = wb[sheet] if sheet in wb.sheetnames else wb.active
+    company = (params or {}).get("회사명")
+    if hc.get("회사명") and company:
+        cell = ws[hc["회사명"]]
+        cur = str(cell.value or "")
+        prefix = cur.split(":")[0] if ":" in cur else "회사명"
+        cell.value = f"{prefix}: {company}"
+    if hc.get("preparer") and (params or {}).get("preparer"):
+        ws[hc["preparer"]] = params["preparer"]
+    if hc.get("reviewer") and (params or {}).get("reviewer"):
+        ws[hc["reviewer"]] = params["reviewer"]
+    if hc.get("날짜") and (params or {}).get("날짜"):
+        ws[hc["날짜"]] = _coerce_date(params["날짜"])
+    if concl.get("cell"):
+        ws[concl["cell"]] = "수정사항 제외하고 특이사항 없음" if has_adjust else "특이사항 없음"
+    wb.save(path)
+    wb.close()
+
+
+def _light_cached(full, sheet, parsed, code):
+    """완성본에서 총괄표만 뽑은 가벼운 생성용 템플릿(변환자료 캐시, 소스 변경 시 자동 갱신)."""
+    import hashlib
+    from generators.sheet_surgery import extract_light
+    st = Path(full).stat()
+    h = hashlib.sha1(f"{int(st.st_mtime)}_{st.st_size}_{_PARSER_VER}".encode()).hexdigest()[:10]
+    light = str(Path(parsed) / f"__light_{code}_{h}.xlsx")
+    if not os.path.exists(light):
+        for old in Path(parsed).glob(f"__light_{code}_*.xlsx"):   # 구버전 정리
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        extract_light(full, sheet, light)
+    return light
+
+
 def build_lead_all(*, settlement, registry, config_dir, template_root, output_dir,
                    params=None, parsed_dir=None):
-    """레지스트리의 모든 총괄표를 일괄 생성한다(엔진형 + 특수형 통합).
+    """레지스트리의 모든 총괄표를 완성본(보조시트·컨트롤 포함)에 채워 일괄 생성한다.
 
-    정산표 파싱은 변환자료에 캐시되어 조서 간 공유된다(재파싱 0). 마지막에 라우팅
-    완전성(대분류 중복·누락)을 함께 점검한다(엔진형 config 기준).
+    조서별 흐름: **완성본에서 총괄표만 가벼운 템플릿으로 추출(_light_cached) → 그 위에 정산표
+    데이터 생성(build_a0/build_special) → 수정사항 분개 렌더 → 헤더·결론 작성 → 완성본에
+    총괄표 시트만 zip 이식(graft_sheet)**. 완성본은 openpyxl로 절대 열지 않아 보조시트의
+    양식컨트롤·매크로·도형이 100% 보존된다.
 
-    registry 항목: {"code","config","template", "kind"?}
-      kind 생략/"engine" → build_a0(섹션 렌더). "refill"/"capital"/"cogs"/"sales" → build_special.
+    정산표/수정사항 파싱은 변환자료 캐시로 공유. 라우팅 완전성·미매핑 분개도 함께 점검.
     Returns: ({code: RunReport}, completeness_dict)
     """
+    import yaml
+    from extractors import parse_trial_balance, parse_adjustments
+    from generators import adjust, sheet_surgery
+    from generators.base import apply_col_offset
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     parsed = parsed_dir or str(out_dir.parent / "변환자료")
+    Path(parsed).mkdir(parents=True, exist_ok=True)
     reports = {}
     engine_configs = []
+
+    def _cfg(item):
+        return apply_col_offset(yaml.safe_load((Path(config_dir) / item["config"]).read_text(encoding="utf-8")))
+
+    # ---- 분개 매핑 선계산(생성과 무관, 계정 기반) ----
+    adj = []
+    rel_by_code = {}
+    entry_codes = {}
+    mapped = set()
+    try:
+        tb = load_with_cache(settlement, parse_trial_balance, cache_dir=parsed, tag=f"trial_balance_{_PARSER_VER}")
+        adj = load_with_cache(settlement, parse_adjustments, cache_dir=parsed, tag=f"adjustments_{_PARSER_VER}")
+        for item in registry:
+            rel = adjust.related_entries(adj, adjust.owned_tokens(_cfg(item), tb), tb)
+            rel_by_code[item["code"]] = rel
+            mapped.update(e["no"] for e in rel)
+            for e in rel:
+                entry_codes.setdefault(e["no"], []).append(item["code"])
+    except Exception as e:
+        warnings.warn(f"[분개 선계산] 실패: {type(e).__name__}: {e}")
+
+    # ---- 조서별: 추출 → 생성 → 분개 → 헤더/결론 → 이식 ----
     for item in registry:
+        code = item["code"]
         kind = item.get("kind", "engine")
-        tmpl = str(Path(template_root) / item["template"])
-        outp = str(out_dir / f"{item['code']}.xlsx")
-        if kind == "engine":
-            reports[item["code"]] = build_a0(
-                settlement=settlement, template=tmpl, config_dir=config_dir,
-                output=outp, params=params, parsed_dir=parsed, config_file=item["config"])
-        else:
-            reports[item["code"]] = build_special(
-                kind=kind, settlement=settlement, template=tmpl, config_dir=config_dir,
-                config_file=item["config"], output=outp, parsed_dir=parsed)
+        full = str(Path(template_root) / item["template"])
+        outp = str(out_dir / f"{code}{Path(full).suffix}")    # 완성본 확장자 유지(.xlsm 매크로 보존)
         engine_configs.append(item["config"])
+        cfg = _cfg(item)
+        sheet = cfg["sheet"]
+        report = RunReport()
+        reports[code] = report
+        gen = str(out_dir / f"__gen_{code}.xlsx")
+        try:
+            light = _light_cached(full, sheet, parsed, code)
+            if kind == "engine":
+                report = build_a0(settlement=settlement, template=light, config_dir=config_dir,
+                                  output=gen, params=params, parsed_dir=parsed, config_file=item["config"])
+            else:
+                report = build_special(kind=kind, settlement=settlement, template=light,
+                                       config_dir=config_dir, config_file=item["config"],
+                                       output=gen, parsed_dir=parsed)
+            reports[code] = report
+            # 수정사항 분개(gen에 렌더 — gen은 1회용이라 openpyxl 무방)
+            try:
+                if code == "GG":
+                    ec = {no: [c for c in cs if c != "GG"] for no, cs in entry_codes.items()}
+                    n = adjust.render(gen, sheet, adj, mode="refer", entry_codes=ec)
+                else:
+                    n = adjust.render(gen, sheet, rel_by_code.get(code, []))
+                if n:
+                    report.add("생성", "ok", f"수정사항 분개 {n}건 반영")
+            except Exception as e:
+                report.add("출력", "warn", f"수정사항 렌더 실패({type(e).__name__}: {e})")
+            # 헤더 + 결론
+            try:
+                # GG는 전체 분개를 refer로 표시하므로 결론도 '분개 존재 여부'로 판단.
+                _has_adj = bool(adj) if code == "GG" else bool(rel_by_code.get(code))
+                _apply_header_conclusion(gen, sheet, cfg, params, has_adjust=_has_adj)
+            except Exception as e:
+                report.add("출력", "warn", f"헤더/결론 작성 실패({type(e).__name__}: {e})")
+            # 이식: 완성본에 총괄표 시트만 옮김(컨트롤·매크로 보존)
+            sheet_surgery.graft_sheet(full, gen, sheet, outp)
+            report.add("출력", "ok", f"완성본 이식 → {Path(outp).name}")
+        except Exception as e:
+            report.add("생성", "error", f"{code} 생성 실패({type(e).__name__}: {e})")
+        finally:
+            if os.path.exists(gen):
+                try:
+                    os.remove(gen)
+                except OSError:
+                    pass
+
+    # 미매핑 분개(어느 조서에도 안 붙음) → 경고
+    comp_adj = [(e["no"], [l["계정"] for l in e["lines"]]) for e in adj if e["no"] not in mapped]
     comp = routing_completeness(settlement, config_dir, engine_configs, parsed_dir=parsed)
+    comp["unmapped_adjustments"] = comp_adj
     return reports, comp

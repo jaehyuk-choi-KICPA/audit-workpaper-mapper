@@ -19,20 +19,23 @@ from pipeline import build_lead_all
 # 조서 레지스트리: code / config(YAML) / template(양식 루트 기준) / kind(생략=engine).
 # kind: engine=a0.py 섹션 렌더 / refill·capital·cogs·sales=고정격자 특수 생성기.
 REGISTRY = [
-    {"code": "A-0", "config": "a0.yaml", "template": "A-0_4000_A000_template.xlsx"},
-    {"code": "C",   "config": "c.yaml",  "template": "C_4000_template.xlsx"},
-    {"code": "AA",  "config": "aa.yaml", "template": "AA_4000_template.xlsx"},
-    {"code": "CC",  "config": "cc.yaml", "template": "CC_4000_template.xlsx"},
-    {"code": "D",   "config": "d.yaml",  "template": "D_4000_template.xlsx"},
-    {"code": "EE",  "config": "ee.yaml", "template": "EE_4000_template.xlsx"},
-    {"code": "R",   "config": "r.yaml",  "template": "R_4000_template.xlsx"},
-    {"code": "S",   "config": "s.yaml",  "template": "S_4000_template.xlsx"},
+    {"code": "A-0", "config": "a0.yaml", "template": "A-0_4000_template_현금및현금성자산.xlsx"},
+    {"code": "C",   "config": "c.yaml",  "template": "C_4000_template_매출채권.xlsm"},
+    {"code": "AA",  "config": "aa.yaml", "template": "AA_4000_template_매입채무.xlsx"},
+    {"code": "CC",  "config": "cc.yaml", "template": "CC_4000_template_기타부채.xlsx"},
+    {"code": "D",   "config": "d.yaml",  "template": "D_4000_template_기타자산.xlsx"},
+    {"code": "E",   "config": "e.yaml",  "template": "E_4000_template_재고자산.xlsm"},
+    {"code": "R",   "config": "r.yaml",  "template": "R_4000_template_판매비와관리비.xlsx"},
+    {"code": "S",   "config": "s.yaml",  "template": "S_4000_template_기타손익.xlsx"},
     # 특수형(고정격자 — 엔진 섹션 렌더로 안 맞는 조서)
-    {"code": "R-2",  "config": "r2.yaml",   "template": "R2_4000_template.xlsx",   "kind": "refill"},
-    {"code": "Q",    "config": "q.yaml",    "template": "Q_4000_template.xlsx",    "kind": "cogs"},
-    {"code": "P",    "config": "p.yaml",    "template": "P_4000_template.xlsx",    "kind": "sales"},
-    {"code": "GG",   "config": "gg.yaml",   "template": "GG_4000_template.xlsx",   "kind": "capital"},
-    {"code": "BBDD", "config": "bbdd.yaml", "template": "BBDD_4000_template.xlsx", "kind": "refill"},
+    {"code": "R-2",  "config": "r2.yaml",   "template": "R2_4000_template_인건비.xlsx",   "kind": "refill"},
+    {"code": "Q",    "config": "q.yaml",    "template": "Q_4000_template_매출원가.xlsm",    "kind": "cogs"},
+    {"code": "P",    "config": "p.yaml",    "template": "P_4000_template_매출.xlsx",    "kind": "sales"},
+    {"code": "GG",   "config": "gg.yaml",   "template": "GG_4000_template_자본.xlsx",   "kind": "capital"},
+    {"code": "BBDD", "config": "bbdd.yaml", "template": "BBDD_4000_template_장단기차입금.xlsx", "kind": "refill"},
+    {"code": "EE",   "config": "ee2.yaml",  "template": "EE_4000_template_퇴직급여.xlsx",   "kind": "retirement"},
+    {"code": "B",    "config": "b.yaml",    "template": "B_4000_template_매도가능증권.xlsx",    "kind": "rows"},
+    {"code": "G",    "config": "g.yaml",    "template": "G_4000_template_유무형자산.xlsx"},
 ]
 
 
@@ -62,6 +65,11 @@ def main(argv=None):
         print("⚠ 중복소유:", comp["duplicate"])
     print(f"미매핑(아직 조서 없음) {len(comp['unmapped'])}종:")
     print("  " + ", ".join(comp["unmapped"]))
+    ua = comp.get("unmapped_adjustments") or []
+    if ua:
+        print(f"\n⚠ 미매핑 수정분개 {len(ua)}건 — 어느 조서에도 안 붙음(특수항목 등, 수동 확인):")
+        for no, accts in ua:
+            print(f"  #{no}: {', '.join(accts)}")
     return 0
 
 

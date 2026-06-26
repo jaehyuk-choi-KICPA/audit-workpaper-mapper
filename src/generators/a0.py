@@ -17,6 +17,7 @@
 
 import re
 
+from openpyxl.cell.cell import MergedCell
 from openpyxl.utils import column_index_from_string
 
 from .base import WorkpaperGenerator
@@ -74,6 +75,16 @@ class A0Generator(WorkpaperGenerator):
         scope = b.get("subtotal_scope", "group") if sub else "none"
         ds_row = b["data_start_row"]
 
+        def wset(addr, val):
+            # 렌더 경로에 남은 병합 셀(insert_rows가 안 옮긴 설명/Test 병합 잔재)에 쓰면
+            # MergedCell 쓰기 오류 → 그 병합을 해제하고 쓴다(데이터 영역이라 해제가 맞다).
+            if isinstance(self.ws[addr], MergedCell):
+                for rng in list(self.ws.merged_cells.ranges):
+                    if addr in rng:
+                        self.ws.unmerge_cells(str(rng))
+                        break
+            self.ws[addr] = val
+
         def setfmt(col, row):
             if col in numc:
                 self.ws[f"{col}{row}"].number_format = numf
@@ -85,22 +96,22 @@ class A0Generator(WorkpaperGenerator):
                 val = rec.get(key)
                 if key == "수정사항" and val in (0, None):
                     val = None
-                self.ws[f"{col}{r}"] = val
+                wset(f"{col}{r}", val)
                 setfmt(col, r)
             for col, tmpl in detail_f.items():
-                self.ws[f"{col}{r}"] = tmpl.format(r=r)
+                wset(f"{col}{r}", tmpl.format(r=r))
                 setfmt(col, r)
 
         def render_subtotal(r, first, last, label=None):
-            self.ws[f'{sub["label_col"]}{r}'] = label or sub["label"]
+            wset(f'{sub["label_col"]}{r}', label or sub["label"])
             if sub.get("label_merge"):
                 self.safe_merge(sub["label_merge"].format(r=r))
             for col in sub.get("sum_cols", []):
-                self.ws[f"{col}{r}"] = (f"=SUM({col}{first}:{col}{last})"
-                                        if last >= first else 0)
+                wset(f"{col}{r}", (f"=SUM({col}{first}:{col}{last})"
+                                   if last >= first else 0))
                 setfmt(col, r)
             for col, tmpl in sub.get("formulas", {}).items():
-                self.ws[f"{col}{r}"] = tmpl.format(r=r)
+                wset(f"{col}{r}", tmpl.format(r=r))
                 setfmt(col, r)
 
         # groups_flag: 명시 목록 대신 정산표의 플래그(예: 판관비) True 대분류를 정산표 순서로
@@ -151,14 +162,35 @@ class A0Generator(WorkpaperGenerator):
         dsub = self.capture_row_style(b["donor_subtotal_row"]) if sub else dd
         delta = needed - (note_row - ds_row)
         if delta > 0:
-            self.ws.insert_rows(ds_row, delta)             # 초과분만 삽입(부족 시 빈 격자 유지)
+            # ★ openpyxl insert_rows의 병합 처리는 버전마다 달라(안 옮기거나 metadata만 옮김) 렌더
+            #   경로에 병합 잔재가 남으면 MergedCell 쓰기오류·테두리 소실이 난다. 결정적으로:
+            #   삽입 '전에' ds_row 이상 병합을 떼고 → 삽입 → delta만큼 내려 다시 병합(설명/Test
+            #   영역은 렌더 구간 바로 아래로 정확히 이동, 렌더 구간은 병합 없는 깨끗한 셀).
+            from openpyxl.worksheet.cell_range import CellRange
+            saved = [str(m) for m in self.ws.merged_cells.ranges if m.min_row >= ds_row]
+            for ref in saved:
+                self.ws.unmerge_cells(ref)
+            self.ws.insert_rows(ds_row, delta)
+            for ref in saved:
+                rng = CellRange(ref); rng.shift(0, delta)
+                self.ws.merge_cells(str(rng))
+
+        # 렌더 구간 병합 무조건 해제(삽입 여부 무관 — delta<=0면 템플릿이 렌더보다 행이 많아
+        #   기존 설명/Test 병합이 렌더 경로에 남는다 → apply_row_style가 MergedCell에 테두리를
+        #   못 입혀 'R..테두리 소실' 발생. 데이터 영역이라 해제가 맞다).
+        from openpyxl.worksheet.cell_range import CellRange as _CR
+        last_render = ds_row + needed - 1
+        for ref in [str(m) for m in self.ws.merged_cells.ranges]:
+            rng = _CR(ref)
+            if rng.min_row <= last_render and rng.max_row >= ds_row:
+                self.ws.unmerge_cells(ref)
 
         # 렌더(도너 스타일 적용 → 삽입 행도 테두리 보존)
         r = ds_row
         for section, groups in live:
             if section.get("marker"):
                 self.apply_row_style(r, dm)
-                self.ws[f'{marker_col}{r}'] = section["marker"]
+                wset(f'{marker_col}{r}', section["marker"])
                 r += 1
             sec_first = r
             for g in groups:
@@ -200,11 +232,13 @@ class A0Generator(WorkpaperGenerator):
 
         entries = [e for e in adj_entries if related(e)]
 
-        # 관련 수정분개가 없으면 템플릿의 '해당사항 없음'을 그대로 둔다(건드리지 않음).
+        # 항상 비운다(다른 회사 완성본 템플릿의 분개 잔재 제거 — 관련 분개가 없는데 템플릿을 그대로
+        # 두면 타사 분개가 노출됨). 관련 분개가 없으면 '해당사항 없음'만 남긴다.
+        self.clear_values(a["data_start_row"], a["clear_until_row"])
         if not entries:
+            self.ws[f'{a["debit_acct_col"]}{a["data_start_row"]}'] = "해당사항 없음"
             return None, 0
 
-        self.clear_values(a["data_start_row"], a["clear_until_row"])
         numf, numc = a["num_format"], set(a["num_cols"])
 
         def setamt(col, row, val):

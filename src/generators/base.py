@@ -5,12 +5,68 @@
 상속해 동일하게 활용한다.
 """
 
-from copy import copy
+import re
+from copy import copy, deepcopy
 from pathlib import Path
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill
+from openpyxl.utils import column_index_from_string, get_column_letter
 import yaml
+
+
+def apply_col_offset(cfg: dict) -> dict:
+    """config의 `col_offset`만큼 본문 컬럼 참조를 일괄 +이동(로드 시 1회).
+
+    사용자가 총괄표 본문 앞에 빈 열을 추가하면 모든 본문 컬럼이 우측으로 밀린다. config 값
+    자체를 다시 쓰지 않고(주석 보존), 로드 시 컬럼류 필드만 offset만큼 옮긴다. **행번호·셀주소
+    (header_cells/conclusion)·계정명/앵커 텍스트는 건드리지 않는다** — 순수 본문 컬럼만.
+    """
+    off = cfg.get("col_offset", 0)
+    if not off:
+        return cfg
+    cfg = deepcopy(cfg)
+
+    def sl(L):                                  # 컬럼 문자 +off
+        return get_column_letter(column_index_from_string(L) + off)
+
+    def sf(s):                                  # 수식 내 'X{r}' 컬럼 참조 +off
+        return re.sub(r"([A-Z]+)(?=\{r\})", lambda m: sl(m.group(1)), s)
+
+    for k in ("base_col", "end_col", "adj_col", "pct_col"):
+        if isinstance(cfg.get(k), str):
+            cfg[k] = sl(cfg[k])
+    if isinstance(cfg.get("name_col"), int):
+        cfg["name_col"] += off
+    if isinstance(cfg.get("formulas"), dict):
+        cfg["formulas"] = {sl(k): sf(v) for k, v in cfg["formulas"].items()}
+    for row in cfg.get("rows", []) or []:       # 고정 다중행(B) — 행별 컬럼
+        for k in ("base_col", "end_col", "adj_col"):
+            if isinstance(row.get(k), str):
+                row[k] = sl(row[k])
+
+    b = cfg.get("body")
+    if isinstance(b, dict):
+        if isinstance(b.get("marker_col"), str):
+            b["marker_col"] = sl(b["marker_col"])
+        if isinstance(b.get("columns"), dict):
+            b["columns"] = {k: (sl(v) if isinstance(v, str) else v) for k, v in b["columns"].items()}
+        if isinstance(b.get("detail_formulas"), dict):
+            b["detail_formulas"] = {sl(k): sf(v) for k, v in b["detail_formulas"].items()}
+        for k in ("num_cols", "pct_cols", "grid_skip"):
+            if isinstance(b.get(k), list):
+                b[k] = [sl(x) for x in b[k]]
+        st = b.get("subtotal")
+        if isinstance(st, dict):
+            if isinstance(st.get("label_col"), str):
+                st["label_col"] = sl(st["label_col"])
+            if isinstance(st.get("label_merge"), str):
+                st["label_merge"] = sf(st["label_merge"])
+            if isinstance(st.get("sum_cols"), list):
+                st["sum_cols"] = [sl(x) for x in st["sum_cols"]]
+            if isinstance(st.get("formulas"), dict):
+                st["formulas"] = {sl(k): sf(v) for k, v in st["formulas"].items()}
+    return cfg
 
 
 class WorkpaperGenerator:
@@ -28,7 +84,7 @@ class WorkpaperGenerator:
 
     def _load_config(self, config_path: str) -> dict:
         with open(config_path, encoding="utf-8") as f:
-            return yaml.safe_load(f)
+            return apply_col_offset(yaml.safe_load(f))
 
     def open_template(self):
         self.wb = openpyxl.load_workbook(self.template_path)
@@ -87,7 +143,7 @@ class WorkpaperGenerator:
         초기화(clear_region) 전에 도너 행에서 호출해 두고, 새로 쓰는 행에
         apply_row_style로 입혀 테두리 등 양식을 보존한다.
         """
-        styles = {}
+        styles = {"_height": self.ws.row_dimensions[row].height}   # 행 높이도 보존(삽입행 높이 불일치 방지)
         for col in range(1, self.ws.max_column + 1):
             c = self.ws.cell(row=row, column=col)
             styles[col] = {
@@ -100,8 +156,13 @@ class WorkpaperGenerator:
         return styles
 
     def apply_row_style(self, row: int, styles: dict) -> None:
-        """capture_row_style로 캡처한 스타일을 지정 행에 입힌다."""
+        """capture_row_style로 캡처한 스타일(+행 높이)을 지정 행에 입힌다."""
+        h = styles.get("_height")
+        if h is not None:
+            self.ws.row_dimensions[row].height = h
         for col, st in styles.items():
+            if col == "_height":
+                continue
             c = self.ws.cell(row=row, column=col)
             c.font = copy(st["font"])
             c.border = copy(st["border"])

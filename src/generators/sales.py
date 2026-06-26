@@ -17,6 +17,8 @@ from copy import copy
 from pathlib import Path
 
 import openpyxl
+from openpyxl.styles import Border, Side
+from openpyxl.utils import column_index_from_string
 
 _NUMF = '#,##0;[Red]\\(#,##0\\);"-"'
 _PCTF = '0%;[Red]\\(0%\\)'
@@ -104,32 +106,191 @@ def fill_cogs(template, tb_rows, output, cfg):
         if nm.startswith(cogs_anchor) and cogs_row is None:
             cogs_row = r
 
-    # 2) 상품매출원가(있을 때만) → 공사매출원가 아래에 행 삽입 + 매출원가계
-    comm_agg, has_comm = _agg_rule(tb_rows, cfg["commodity_rule"])
+    # 2) 공사매출원가 아래에 매출원가 종류별(상품·제품·용역 등) 집계를 펼친다. 각 종류는 손익 매출원가
+    #    섹션의 하위행(원가상세, 상위=종류)을 가진다: 기말재고 하위행이 있으면 롤포워드(기초+투입−기말),
+    #    없으면 구성요소 합(용역수수료 등). 종류마다 매출원가 행 아래 검은(medium) 밑줄로 구분. 공사·도급은
+    #    템플릿 고정 블록이라 제외. 최종 '계' = 공사 + 각 종류 매출원가.
+    ncols = ws.max_column
+    total_label = cfg.get("total_label", "계")
     n_extra = 0
-    if has_comm and any(comm_agg[k] for k in ("기초", "기말", "수정사항")) and cogs_row:
-        ws.insert_rows(cogs_row + 1, 2)
-        comm_r, total_r = cogs_row + 1, cogs_row + 2
-        ncols = ws.max_column
-        _copy_row_style(ws, cogs_row, comm_r, ncols)
-        _copy_row_style(ws, cogs_row, total_r, ncols)
-        # 상품매출원가 행
-        ws.cell(comm_r, nci).value = cfg.get("commodity_label", "상품매출원가")
-        put(comm_r, comm_agg)
-        # 매출원가계 = 공사매출원가 + 상품매출원가
-        ws.cell(total_r, nci).value = cfg.get("total_label", "매출원가계")
+
+    def _vrow(r, label, rec):
+        _copy_row_style(ws, cogs_row, r, ncols)
+        ws.cell(r, nci).value = label
+        put(r, rec)
+
+    def _frow(r, label, fml):
+        _copy_row_style(ws, cogs_row, r, ncols)
+        ws.cell(r, nci).value = label
         for col in (bcol, ecol, acol):
-            ws[f"{col}{total_r}"] = f"={col}{cogs_row}+{col}{comm_r}"
-            ws[f"{col}{total_r}"].number_format = _NUMF
+            ws[f"{col}{r}"] = fml(col); ws[f"{col}{r}"].number_format = _NUMF
         for col, tmpl in formulas.items():
-            ws[f"{col}{total_r}"] = tmpl.format(r=total_r)
-            ws[f"{col}{total_r}"].number_format = _PCTF if col == cfg.get("pct_col") else _NUMF
-        n_extra = 2
+            ws[f"{col}{r}"] = tmpl.format(r=r)
+            ws[f"{col}{r}"].number_format = _PCTF if col == cfg.get("pct_col") else _NUMF
+
+    _right = max([nci] + [column_index_from_string(c) for c in (bcol, ecol, acol, *formulas.keys())])
+
+    def _underline(r):                              # 매출원가 종류 구분 검은(medium) 밑줄
+        for ci in range(nci, _right + 1):
+            cell = ws.cell(r, ci); bd = cell.border
+            cell.border = Border(left=bd.left, right=bd.right, top=bd.top, bottom=Side(style="medium"))
+
+    def _is_end(name):                              # 기말재고(차감 항목) 판정
+        n = _norm(name)
+        return "기말" in n and "재고" in n
+
+    def _subs(parent):                              # 그 종류의 하위행(정산표 순서)
+        return [{"name": r["계정명"], "기초": r["기초"] or 0, "기말": r["기말"] or 0,
+                 "수정사항": r["수정사항"] or 0}
+                for r in tb_rows if r.get("원가상세") and r.get("상위") == parent]
+
+    # 매출원가 종류(계정명 단위, 정산표 순서, 공사/도급 제외 — 공사 롤포워드는 템플릿 블록)
+    types, seen = [], set()
+    for r in tb_rows:
+        if not r.get("매출원가"):
+            continue
+        nm, cls = r["계정명"], r["대분류"]
+        key = _norm(nm)
+        if not key or key in seen or any(k in _norm(cls) + key for k in ("공사", "도급")):
+            continue
+        if not any(r.get(k) for k in ("기초", "기말", "수정사항")):
+            continue
+        seen.add(key)
+        types.append((nm, cls, {"기초": r["기초"] or 0, "기말": r["기말"] or 0, "수정사항": r["수정사항"] or 0}))
+
+    def _type_rows(parent):                         # 그 종류가 차지할 행수
+        subs = _subs(parent)
+        if not subs:
+            return 1
+        adds = [s for s in subs if not _is_end(s["name"])]
+        ends = [s for s in subs if _is_end(s["name"])]
+        return len(adds) + (1 + len(ends) if ends else 0) + 1
+
+    if cogs_row and types:
+        n_rows = sum(_type_rows(cls) for _, cls, _ in types) + 1   # 종류들 + 최종 계
+        ws.insert_rows(cogs_row + 1, n_rows)
+        _underline(cogs_row)                        # 공사매출원가 아래 밑줄
+        r = cogs_row + 1
+        sum_rows = [cogs_row]
+        for label, cls, agg in types:
+            subs = _subs(cls)
+            if not subs:                            # 하위행 없음 → 단일 매출원가 행
+                _vrow(r, label, agg); sum_rows.append(r); _underline(r); r += 1
+                continue
+            adds = [s for s in subs if not _is_end(s["name"])]
+            ends = [s for s in subs if _is_end(s["name"])]
+            a0 = r
+            for s in adds:
+                _vrow(r, s["name"], s); r += 1
+            if ends:
+                _frow(r, "계", lambda c, x=a0, n=len(adds): "=" + "+".join(f"{c}{x+i}" for i in range(n)))
+                gye = r; r += 1
+                for s in ends:
+                    _vrow(r, s["name"], s); r += 1
+                _frow(r, label, lambda c, g=gye, e0=gye + 1, ne=len(ends):
+                      f"={c}{g}-(" + "+".join(f"{c}{e0+i}" for i in range(ne)) + ")")
+            else:                                   # 차감 없음 → 구성요소 합
+                _frow(r, label, lambda c, x=a0, n=len(adds): "=" + "+".join(f"{c}{x+i}" for i in range(n)))
+            sum_rows.append(r); _underline(r); r += 1
+        _frow(r, total_label, lambda c, rows=tuple(sum_rows): "=" + "+".join(f"{c}{x}" for x in rows))
+        n_extra = n_rows
 
     _widen(ws, [bcol, ecol, acol] + list(formulas.keys()))
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output)
-    return {"commodity_cogs": comm_agg["기말"] if has_comm else 0, "rows_inserted": n_extra}
+    return {"rows_inserted": n_extra}
+
+
+# ─────────────────────────────── EE: 퇴직급여 ───────────────────────────────
+
+def fill_retirement(template, tb_rows, output, cfg):
+    """EE 퇴직급여 총괄표. 퇴직급여 비용(판관/제조)을 충당부채 위에 행 삽입해 제조 flag로
+    채우고, BS 행(충당부채·운용자산)은 정산표에 있으면 채우고 없으면 비운다(타 회사 잔재 제거).
+
+    cfg: {sheet, name_col, base_col(기초), end_col(기말), adj_col(수정), formulas,
+          insert_above, total_anchor, expense_rows[{label, rule}], bs_rows[{label, name}]}
+    """
+    sheet = cfg["sheet"]
+    nci = cfg.get("name_col", 2)
+    bcol, ecol, acol = cfg["base_col"], cfg["end_col"], cfg["adj_col"]
+    formulas = cfg.get("formulas", {})
+
+    by_class = defaultdict(lambda: {"기초": 0, "기말": 0, "수정사항": 0})
+    for rec in tb_rows:
+        g = by_class[_norm(rec["대분류"])]
+        for k in ("기초", "기말", "수정사항"):
+            g[k] += rec[k] or 0
+
+    wb = openpyxl.load_workbook(template)
+    ws = wb[sheet]
+    ncols = ws.max_column
+
+    ins_anchor = _norm(cfg["insert_above"])
+    tot_anchor = _norm(cfg["total_anchor"])
+    ins_row = tot_row = None
+    for r in range(1, ws.max_row + 1):
+        nm = _norm(ws.cell(r, nci).value)
+        if ins_row is None and nm.startswith(ins_anchor):
+            ins_row = r
+        if tot_row is None and nm.startswith(tot_anchor):
+            tot_row = r
+
+    def _put(r, rec, label):
+        ws.cell(r, nci).value = label
+        ws[f"{bcol}{r}"] = rec["기초"]; ws[f"{bcol}{r}"].number_format = _NUMF
+        ws[f"{ecol}{r}"] = rec["기말"]; ws[f"{ecol}{r}"].number_format = _NUMF
+        ws[f"{acol}{r}"] = rec.get("수정사항") or 0; ws[f"{acol}{r}"].number_format = _NUMF
+        for col, tmpl in formulas.items():
+            ws[f"{col}{r}"] = tmpl.format(r=r); ws[f"{col}{r}"].number_format = _NUMF
+
+    exp = cfg.get("expense_rows", [])
+    n_exp = 0
+    if ins_row and exp:
+        ws.insert_rows(ins_row, len(exp))
+        donor = ins_row + len(exp)            # 밀려난 원래 BS 행 = 도너
+        for i in range(len(exp)):
+            _copy_row_style(ws, donor, ins_row + i, ncols)
+        if tot_row and tot_row >= ins_row:
+            tot_row += len(exp)
+        for i, spec in enumerate(exp):
+            agg, _ = _agg_rule(tb_rows, spec["rule"])
+            _put(ins_row + i, agg, spec["label"])
+        n_exp = len(exp)
+
+    # BS 행: 정산표에 있으면 채우고, 없으면 값을 비운다(타사 잔재 제거)
+    data_start = ins_row if ins_row else 1
+    n_bs = 0
+    for spec in cfg.get("bs_rows", []):
+        lbl = _norm(spec["label"])
+        rec = by_class.get(_norm(spec["name"]))
+        for r in range(data_start, (tot_row or ws.max_row)):
+            if not _norm(ws.cell(r, nci).value).startswith(lbl):
+                continue
+            if rec and any(rec[k] for k in ("기초", "기말", "수정사항")):
+                _put(r, rec, ws.cell(r, nci).value)
+                n_bs += 1
+            else:    # 없는 항목 → 값 비움(라벨·테두리는 보존), 변동분해/체크열까지 클리어
+                from openpyxl.utils import get_column_letter
+                for ci in range(column_index_from_string(bcol), ncols + 1):
+                    cell = ws.cell(r, ci)
+                    if not isinstance(cell, openpyxl.cell.cell.MergedCell):
+                        cell.value = None
+            break
+
+    # Total 행 SUM 범위 재작성(삽입으로 행이 밀렸으므로) + 라벨(Total→계 등)
+    if tot_row and data_start < tot_row:
+        if cfg.get("total_label"):
+            ws.cell(tot_row, nci).value = cfg["total_label"]
+        for col in (bcol, ecol, acol):
+            ws[f"{col}{tot_row}"] = f"=SUM({col}{data_start}:{col}{tot_row - 1})"
+            ws[f"{col}{tot_row}"].number_format = _NUMF
+        for col, tmpl in formulas.items():
+            ws[f"{col}{tot_row}"] = tmpl.format(r=tot_row); ws[f"{col}{tot_row}"].number_format = _NUMF
+
+    _widen(ws, [bcol, ecol, acol] + list(formulas.keys()))
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output)
+    return {"expense_rows": n_exp, "bs_filled": n_bs}
 
 
 # ─────────────────────────────── P: 매출 ───────────────────────────────
@@ -187,9 +348,19 @@ def fill_sales(template, tb_rows, output, cfg):
     if total_row is None:
         total_row = is_start + 1
 
-    # 2) 렌더할 매출 대분류(있고 0 아님)
-    present = [g for g in cfg["is_groups"]
-               if _norm(g) in by_class and any(by_class[_norm(g)][k] for k in ("기초", "기말", "수정사항"))]
+    # 2) 렌더할 매출 계정 = 손익 '매출액' 섹션(매출 flag) 전부. 회사마다 계정명이 달라도 섹션
+    #    통째로 편입. 일부 회사는 한 대분류(Ⅰ.매출액)에 여러 계정 → 계정명 단위로 렌더.
+    flag = cfg.get("owns_flag", "매출")
+    present = [{"name": rec["계정명"], "기초": rec["기초"] or 0, "기말": rec["기말"] or 0,
+                "수정사항": rec["수정사항"] or 0}
+               for rec in tb_rows
+               if rec.get(flag) and any(rec.get(k) for k in ("기초", "기말", "수정사항"))]
+    if not present:                          # 폴백: 매출 flag 없으면 is_groups(구버전 대비)
+        present = [{"name": by_class[_norm(g)]["계정명"] or g,
+                    "기초": by_class[_norm(g)]["기초"], "기말": by_class[_norm(g)]["기말"],
+                    "수정사항": by_class[_norm(g)]["수정사항"]}
+                   for g in cfg.get("is_groups", [])
+                   if _norm(g) in by_class and any(by_class[_norm(g)][k] for k in ("기초", "기말", "수정사항"))]
     needed = max(len(present), 1)
     avail = total_row - is_start            # 합계 위 데이터 행 수
     delta = needed - avail
@@ -204,9 +375,8 @@ def fill_sales(template, tb_rows, output, cfg):
             ws[f"{col}{r}"] = None
         ws.cell(r, nci).value = None
     r = is_start
-    for g in present:
-        rec = by_class[_norm(g)]
-        put(r, rec, rec["계정명"] or g)
+    for rec in present:
+        put(r, rec, rec["name"])
         r += 1
     # 3) 합계 행: SUM 범위 재작성(삽입으로 범위가 어긋날 수 있음)
     ws.cell(total_row, nci).value = cfg.get("is_total_label", "합계")
