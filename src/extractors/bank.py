@@ -25,11 +25,11 @@ _SYNONYMS: dict[str, str] = {
     "금융상품의 종류": "금융상품종류",
     "금융상품의종류": "금융상품종류",
     "계좌번호":      "계좌번호",
-    "금액":          "금액",
+    "금액":          "금액",          # 표시열(J, 예: 'KRW 283,307 (0)') — 폴백용
     "연이자율":      "연이자율",
     "만기일":        "만기일",
     "금액_통화":     "통화",
-    "금액_금액":     "외화금액",
+    "금액_금액":     "금액_금액",      # 숫자 전용열(Q, 예: 283307.0) — 금액의 1차 소스
 }
 
 # 1번 섹션 헤더로 인정하기 위한 최소 필수 컬럼
@@ -76,22 +76,44 @@ def _classify(product_kind) -> str:
     return "현금성자산"
 
 
+def _first_num(s):
+    """표시열('KRW 283,307 (0)')에서 괄호 앞 첫 숫자만 추출(폴백). 괄호 0이 붙는 오파싱 방지."""
+    if s is None:
+        return None
+    head = str(s).split("(")[0]            # 'KRW 283,307 (0)' → 'KRW 283,307 '
+    m = re.search(r"-?[\d,]+\.?\d*", head)
+    return m.group(0) if m else None
+
+
+def _is_fx_cur(cur) -> bool:
+    if cur is None:
+        return False
+    return str(cur).strip().upper() not in ("", "KRW", "WON", "원", "￦", "\\")
+
+
 def _to_record(row: tuple, cm: dict[str, int]) -> dict:
     def g(col: str):
         idx = cm.get(col)
         return row[idx] if idx is not None and idx < len(row) else None
 
     kind = g("금융상품종류")
+    cur = g("통화")
+    # 금액은 **숫자 전용열('금액_금액', 예: 283307.0)** 을 1차로 쓴다. 없으면 표시열(J)에서
+    # 괄호 앞 숫자만 폴백 추출('KRW 283,307 (0)' → 283307). 통화가 외화면 그 숫자는 외화금액.
+    num = g("금액_금액")
+    if num is None or str(num).strip() == "":
+        num = _first_num(g("금액"))
+    is_fx = _is_fx_cur(cur)
     return {
         "조서번호":     g("조서번호"),
         "금융기관명":   g("금융기관명"),
         "금융상품종류": kind,
         "계좌번호":     g("계좌번호"),
-        "금액":         g("금액"),
+        "금액":         (None if is_fx else num),   # KRW 잔액(숫자)
         "연이자율":     g("연이자율"),
         "만기":         _format_maturity(g("만기일")),
-        "통화":         g("통화"),
-        "외화금액":     g("외화금액"),
+        "통화":         cur,
+        "외화금액":     (num if is_fx else None),    # 외화 잔액(숫자) → a200에서 환율×환산
         "계정분류":     _classify(kind),
     }
 

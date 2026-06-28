@@ -19,7 +19,7 @@ from cache import cached_ideal_ledger, load_with_cache
 from extractors import (
     parse_cs,
     parse_bank, parse_bank_loans, parse_bank_collateral,
-    parse_insurance, parse_invest,
+    parse_insurance, parse_invest, parse_invest_eval,
 )
 from generators import (
     A100Generator, A200Generator, build_a200_data,
@@ -142,6 +142,7 @@ def build_a1(*, control_sheet, ledger_src, confirm_xlsx, template, config_dir,
     bank_rows = _safe_parse("BANK(현금성/퇴직)", _cached, parse_bank, confirm_xlsx, "bank")
     ins_groups = _safe_parse("INSURANCE(장기금융)", _cached, parse_insurance, confirm_xlsx, "insurance")
     invest_rows = _safe_parse("INVESTMENT(단기금융)", _cached, parse_invest, confirm_xlsx, "invest")
+    invest_eval = _safe_parse("INVESTMENT 2번(평가액)", _cached, parse_invest_eval, confirm_xlsx, "invest_eval")
     loan_rows = _safe_parse("대출(BANK 2-2)", _cached, parse_bank_loans, confirm_xlsx, "loans")
     coll_rows = _safe_parse("담보(BANK 9)", _cached, parse_bank_collateral, confirm_xlsx, "collateral")
     ref_map = _safe_parse("취합 요약(조서번호)", _cached, build_ref_map, confirm_xlsx, "refmap", default={})
@@ -153,7 +154,8 @@ def build_a1(*, control_sheet, ledger_src, confirm_xlsx, template, config_dir,
         fx_rates = _safe_parse("기말환율 메모(참고자료)", load_fx_rates, ref_dir, default={}) or {}
 
     # ---- STEP 2~4. 변환 ----
-    a200_data = build_a200_data(ledger_rows, bank_rows, ins_groups, invest_rows, fx_rates=fx_rates)
+    a200_data = build_a200_data(ledger_rows, bank_rows, ins_groups, invest_rows,
+                                fx_rates=fx_rates, invest_eval=invest_eval)
     a300_data = build_a300_data(bank_rows, loan_rows, coll_rows)
 
     # 외화 기말환산 불일치 집계(진단)

@@ -221,43 +221,148 @@ def _build_longterm_rows(ledger_lt: list[dict], ins_groups: list[dict]) -> list[
 # 단기금융상품: 거래처원장 단기매매/단기금융 ↔ INVESTMENT (금액 1:1 역매핑)
 # ---------------------------------------------------------------------------
 
-def _build_shortterm_rows(ledger_st: list[dict], invest_rows: list[dict]) -> list[dict]:
-    by_amt: dict[int, list[dict]] = defaultdict(list)
-    for v in invest_rows:
-        by_amt[_amt(v["금액"])].append(v)
+def _build_shortterm_rows(ledger_st: list[dict], invest_eval: list[dict]) -> list[dict]:
+    """단기금융상품 = INVESTMENT 2번 **평가액(계좌별 합)** driven.
 
+    회신금액(O) = 조회서 평가액 합. 회사계상액(H) = 거래처원장 단기금융 잔액(이름 매칭).
+    평가액 ≠ 회사계상액이면 _평가액불일치 → (*) '단기금융상품 미평가 의심' 각주.
+    조회서-우선: 평가액 항목은 거래처원장 매칭 실패와 무관하게 **전부 행 생성**.
+    """
     rows = []
-    for L in ledger_st:
-        company_amt = _amt(L["잔액"])
-        if company_amt <= 0:
-            continue
-        ledger_name = _clean_inst_name(L["거래처명"])
-        chosen = None
-        cands = by_amt.get(company_amt)
-        if cands:
-            for i, v in enumerate(cands):
-                vname = _clean_inst_name(v["금융기관명"])
-                if vname and (vname in ledger_name or ledger_name in vname):
-                    chosen = cands.pop(i)
-                    break
-            if chosen is None:
-                chosen = cands.pop(0)
-        matched = chosen is not None
+    used = set()
+    for e in invest_eval:
+        eval_amt = _amt(e["평가액"])
+        inst = _clean_inst_name(e["금융기관명"])
+        company_amt, chosen_L = 0, None
+        for i, L in enumerate(ledger_st):
+            if i in used:
+                continue
+            lname = _clean_inst_name(L["거래처명"])
+            if lname and (lname in inst or inst in lname):
+                chosen_L = L; used.add(i); break
+        if chosen_L is not None:
+            company_amt = _amt(chosen_L["잔액"])
         rows.append({
             "계정분류":   "단기금융상품",
-            "금융기관":   (chosen["금융기관명"] if matched else L["거래처명"]),
-            "구분":       (chosen["금융상품종류"] if matched else None),
-            "계좌번호":   (chosen["계좌번호"] if matched else None),
-            "통화":       ("KRW" if matched else None),
-            "금액":       company_amt,
+            "금융기관":   e["금융기관명"],
+            "구분":       "수익증권 등",
+            "계좌번호":   e.get("계좌번호"),
+            "통화":       "KRW",
+            "금액":       company_amt,                # 회사계상액(H) = 거래처원장
             "이자율":     "-",
             "만기":       "-",
             "사용제한":   _NA,
-            "회신여부":   (_V if matched else None),
-            "회수방법":   (_CONFIRM_ELECTRONIC if matched else None),
-            "조회서번호": (chosen["조서번호"] if matched else None),
-            "회신금액":   (_amt(chosen["금액"]) if matched else None),
-            "_확인필요":  (not matched),
+            "회신여부":   _V,
+            "회수방법":   _CONFIRM_ELECTRONIC,
+            "조회서번호": None,
+            "회신금액":   eval_amt,                   # 평가액(O) = 조회서 2번 합
+            "_평가액불일치": bool(company_amt and eval_amt != company_amt),
+            "_확인필요":  (chosen_L is None),          # 거래처원장 매칭 실패(조회서-only)
+        })
+    # 거래처원장엔 있으나 조회서 평가액에 없는 단기금융 (역 — 조회서 미회신)
+    for i, L in enumerate(ledger_st):
+        if i in used:
+            continue
+        company_amt = _amt(L["잔액"])
+        if company_amt <= 0:
+            continue
+        rows.append({
+            "계정분류":   "단기금융상품",
+            "금융기관":   L["거래처명"],
+            "구분":       None, "계좌번호": None, "통화": None,
+            "금액":       company_amt,
+            "이자율":     "-", "만기": "-", "사용제한": _NA,
+            "회신여부":   None, "회수방법": _CONFIRM_POSTAL, "조회서번호": None,
+            "회신금액":   None,
+            "_확인필요":  True,
+        })
+    return rows
+
+
+def _build_deposit_rows(invest_rows: list[dict], ledger_rows: list[dict]) -> list[dict]:
+    """증권사 예수금(INVESTMENT 1번 K열) → 현금성자산 하위 '예수금' 행 (금융기관별 합).
+
+    회신금액(O) = 조회서 예수금. 회사계상액(H) = 거래처원장 예수금 계정 매칭(있으면), 없으면 0.
+    """
+    by_inst: dict[str, float] = defaultdict(float)
+    inst_acc: dict[str, object] = {}
+    for v in invest_rows:
+        dep = _amt(v.get("예수금"))
+        if dep:
+            name = str(v["금융기관명"]).strip()
+            by_inst[name] += dep
+            inst_acc.setdefault(name, v.get("계좌번호"))
+
+    ledger_dep = [L for L in ledger_rows if "예수금" in (L.get("계정과목") or "")]
+    rows = []
+    for inst, dep in by_inst.items():
+        confirm = _amt(dep)
+        iname = _clean_inst_name(inst)
+        company = 0
+        for L in ledger_dep:
+            lname = _clean_inst_name(L.get("거래처명"))
+            if lname and (lname in iname or iname in lname):
+                company = _amt(L["잔액"]); break
+        rows.append({
+            "계정분류":   "현금성자산",
+            "금융기관":   inst,
+            "구분":       "예수금",
+            "계좌번호":   inst_acc.get(inst),
+            "통화":       "KRW",
+            "금액":       company,
+            "이자율":     "-", "만기": "-", "사용제한": _NA,
+            "회신여부":   _V,
+            "회수방법":   _CONFIRM_ELECTRONIC,
+            "조회서번호": None,
+            "회신금액":   confirm,
+            "_확인필요":  bool(company == 0 or company != confirm),
+        })
+    return rows
+
+
+def _bank_only_cash_row(bank: dict) -> dict:
+    """거래처원장에 없으나 조회서(BANK 현금성)에만 있는 회신 → 표에 행 생성(조회서-우선)."""
+    return {
+        "계정분류":   "현금성자산",
+        "금융기관":   bank.get("금융기관명"),
+        "구분":       bank.get("금융상품종류"),
+        "계좌번호":   bank.get("계좌번호"),
+        "통화":       bank.get("통화"),
+        "금액":       0,                          # 회사계상액 없음(명세서 미보유)
+        "이자율":     bank.get("연이자율"),
+        "만기":       bank.get("만기"), "사용제한": _NA,
+        "회신여부":   _V,
+        "회수방법":   _CONFIRM_ELECTRONIC,
+        "조회서번호": bank.get("조서번호"),
+        "회신금액":   _amt(bank.get("금액")),
+        "_확인필요":  True,
+    }
+
+
+def _build_insurance_only_rows(ledger_lt: list[dict], ins_groups: list[dict]) -> list[dict]:
+    """거래처원장 장기금융에 매칭 안 된 INSURANCE 그룹 → 표에 행 생성(조회서-우선)."""
+    matched_names = set()
+    for L in ledger_lt:
+        if _amt(L["잔액"]) > 0:
+            matched_names.add(_clean_inst_name(L["거래처명"]))
+    rows = []
+    for g in ins_groups:
+        gname = _clean_inst_name(g["금융기관명"])
+        if any(gname and (gname in ln or ln in gname) for ln in matched_names):
+            continue
+        rows.append({
+            "계정분류":   "장기금융상품",
+            "금융기관":   g["금융기관명"],
+            "구분":       g.get("보험의종류"),
+            "계좌번호":   g.get("증권번호"),
+            "통화":       "KRW",
+            "금액":       0,                       # 회사계상액 없음
+            "이자율":     "-", "만기": "-", "사용제한": _NA,
+            "회신여부":   _V,
+            "회수방법":   _CONFIRM_ELECTRONIC,
+            "조회서번호": g.get("조서번호"),
+            "회신금액":   _amt(g.get("조회서금액")),
+            "_확인필요":  True,
         })
     return rows
 
@@ -269,12 +374,19 @@ def _build_shortterm_rows(ledger_st: list[dict], invest_rows: list[dict]) -> lis
 def build_a200_data(ledger_rows: list[dict], bank_rows: list[dict],
                     insurance_groups: list[dict],
                     invest_rows: "list[dict] | None" = None,
-                    fx_rates: "dict | None" = None) -> dict:
-    """A-200 STEP5 데이터(현금성/장기금융/단기금융) + 미매칭 회신을 계산해 반환한다.
+                    fx_rates: "dict | None" = None,
+                    invest_eval: "list[dict] | None" = None) -> dict:
+    """A-200 STEP5 데이터(현금성/장기금융/단기금융)를 계산해 반환한다.
 
+    조회서-우선: 조회서(BANK/INSURANCE/INVESTMENT)에 회신된 항목은 거래처원장 매칭 실패와
+    무관하게 **전부 표에 행으로 기입**한다(정산표 대사는 다음 단계).
+      - 예수금(INVESTMENT 1번)  → 현금성자산 하위 '예수금' 행.
+      - 단기금융상품(INVESTMENT 2번 평가액 합) → 회신금액(O), 회사계상액(H)=거래처원장.
+        O≠H면 (*) '단기금융상품 미평가 의심'.
     fx_rates: {통화: 기말환율}. 외화 계좌의 회신금액을 환율×조회서외화값으로 환산한다.
     """
     invest_rows = invest_rows or []
+    invest_eval = invest_eval or []
     ledger_cash = [r for r in ledger_rows if r.get("계정과목") in _CASH_LEDGER_ACCOUNTS]
     ledger_lt = [r for r in ledger_rows
                  if _LONGTERM_LEDGER_KEYWORD in (r.get("계정과목") or "")]
@@ -283,8 +395,12 @@ def build_a200_data(ledger_rows: list[dict], bank_rows: list[dict],
     bank_cash = [b for b in bank_rows if b.get("계정분류") == "현금성자산"]
 
     cash, leftover = _build_cash_rows(ledger_cash, bank_cash, fx_rates)
+    cash += _build_deposit_rows(invest_rows, ledger_rows)            # 예수금
+    cash += [_bank_only_cash_row(b) for b in leftover                # 조회서-우선(현금성)
+             if _amt(b.get("금액"))]                                  # 0원 회신은 제외(노이즈)
     longterm = _build_longterm_rows(ledger_lt, insurance_groups)
-    shortterm = _build_shortterm_rows(ledger_st, invest_rows)
+    longterm += _build_insurance_only_rows(ledger_lt, insurance_groups)  # 조회서-우선(장기)
+    shortterm = _build_shortterm_rows(ledger_st, invest_eval)        # 평가액-driven
 
     # 실제 사용된 외화·환율만 모아 환율박스용으로 반환 (없으면 빈 dict → 박스 생략)
     fx_used = {}
@@ -296,7 +412,7 @@ def build_a200_data(ledger_rows: list[dict], bank_rows: list[dict],
         "cash": cash,
         "longterm": longterm,
         "shortterm": shortterm,
-        "cash_leftover_bank": leftover,
+        "cash_leftover_bank": [],   # 조회서-우선 기입으로 표에 흡수됨(잔여 없음)
         "fx_used": fx_used,
     }
 
@@ -381,6 +497,9 @@ class A200Generator(WorkpaperGenerator):
             elif rec.get("_기말환산불일치"):
                 note = (f"기말환산 불일치 / {rec.get('통화') or '외화'} "
                         f"(환율×조회서외화값 ≠ 명세서 원화) — A-0에서 조정")
+            elif rec.get("_평가액불일치"):
+                note = ("단기금융상품 미평가 의심: 조회서 평가액(시가) ≠ 회사계상액 "
+                        "→ 평가손익 미반영 가능, 감사인 확인")
             if note is None:
                 self.ws[f"{conc_c}{r}"] = None
                 return

@@ -197,7 +197,11 @@ def suggest_via_llm(payload: dict, *, api_key: str, model: str = _MODEL) -> dict
     try:
         client = anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
-            model=model, max_tokens=300,
+            model=model, max_tokens=1000,
+            temperature=0,                      # 열번호 분류=결정적 → 0(재현성·일관성)
+            system=("너는 회계 표의 헤더 라벨을 표준 필드에 매핑하는 분류기다. "
+                    "요청한 JSON 객체 하나만 출력하고 그 외 텍스트·설명·코드펜스는 내지 않는다. "
+                    "확신이 없는 필드는 값을 null로 둔다."),
             messages=[{"role": "user", "content": prompt}],
         )
         text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
