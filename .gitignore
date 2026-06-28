@@ -27,3 +27,14 @@ dist/
 build/
 *.spec
 .pytest_cache/
+
+# 스크래치·로그·런처 (루프/재검토/리포트 임시물 — 버전관리 제외)
+_loop*.py
+_recheck*.py
+_scratch*
+_rep/
+prompts/
+*.bat
+run_log.txt
+valreport.txt
+*_log.txt
