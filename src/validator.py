@@ -256,3 +256,63 @@ def validate_a200_form(path: str, sheet_name: str, config: dict) -> list[str]:
 
     wb.close()
     return issues
+
+
+def validate_detail_blocks(path: str, sheet_name: str, *, expected_blocks: int,
+                           lead_sheet: str, tie_label: str = "총괄표",
+                           check_label: str = "Check") -> list:
+    """D200/CC200 상세 시트 양식 무결성 검사(생성 직후 게이트).
+
+    검사: tie-out 행 수 = 블록 수 = 계정 수, 각 tie-out이 lead_sheet 참조, Check 행 동반,
+    합계 SUM이 데이터 범위 참조, 리터럴 오류(#REF!/#NAME?/#VALUE!) 텍스트 없음.
+    """
+    issues = []
+    wb = openpyxl.load_workbook(path)
+    ws = wb[sheet_name]
+    tie_norm = re.sub(r"\s+", "", tie_label)
+    chk_norm = re.sub(r"\s+", "", check_label)
+    lead_ref = lead_sheet if not re.search(r"\s", lead_sheet) else f"'{lead_sheet}'"
+
+    tie_rows, chk_rows, sum_rows = [], [], []
+    err_cells = []
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, min(ws.max_column, 12) + 1):
+            v = ws.cell(r, c).value
+            if not isinstance(v, str):
+                continue
+            vn = re.sub(r"\s+", "", v)
+            if tie_norm and vn.startswith(tie_norm) and "→" in v:
+                tie_rows.append(r)
+            elif vn == chk_norm:
+                chk_rows.append(r)
+            elif v.startswith("합계") or vn == "합계":
+                sum_rows.append(r)
+            if any(e in v for e in ("#REF!", "#NAME?", "#VALUE!", "#DIV/0!")):
+                err_cells.append(f"{ws.cell(r, c).coordinate}={v}")
+
+    if len(tie_rows) != expected_blocks:
+        issues.append(f"[블록수] {sheet_name} tie-out {len(tie_rows)}개 ≠ 계정 {expected_blocks}개")
+    if len(chk_rows) < expected_blocks:
+        issues.append(f"[Check] {sheet_name} Check행 {len(chk_rows)}개 < 계정 {expected_blocks}개")
+
+    # tie-out 행이 lead_sheet를 참조하는지
+    for r in set(tie_rows):
+        refs = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)
+                if isinstance(ws.cell(r, c).value, str) and ws.cell(r, c).value.startswith("=")]
+        if not any(lead_ref + "!" in f for f in refs):
+            issues.append(f"[tie] {sheet_name} R{r} 총괄표({lead_sheet}) 참조 누락")
+
+    # 합계 SUM 형식 확인(있으면)
+    for r in set(sum_rows):
+        has_sum = any(isinstance(ws.cell(r, c).value, str) and "SUM(" in (ws.cell(r, c).value or "")
+                      for c in range(1, ws.max_column + 1))
+        zero_only = all((ws.cell(r, c).value in (None, "", 0))
+                        for c in range(5, 8))   # 수치열(E/F/G)만 — 빈 계정 합계=0은 정상
+        if not has_sum and not zero_only:
+            issues.append(f"[합계] {sheet_name} R{r} SUM 수식 없음")
+
+    if err_cells:
+        issues.append(f"[오류값] {sheet_name} 리터럴 오류 {len(err_cells)}건: {err_cells[:4]}")
+
+    wb.close()
+    return issues

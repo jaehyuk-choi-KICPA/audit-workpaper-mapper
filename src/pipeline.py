@@ -20,6 +20,7 @@ from extractors import (
     parse_cs,
     parse_bank, parse_bank_loans, parse_bank_collateral,
     parse_insurance, parse_invest, parse_invest_eval,
+    parse_guarantee,
 )
 from generators import (
     A100Generator, A200Generator, build_a200_data,
@@ -189,6 +190,24 @@ def build_a1(*, control_sheet, ledger_src, confirm_xlsx, template, config_dir,
     _safe_gen("A-300", A300Generator, "a300.yaml", (a300_data, params))
     _safe_gen("Control Sheet", ControlSheetGenerator, "control_sheet.yaml",
               (control_sheet, ref_map, params))
+
+    # ---- FN: GUARANTEE(보증) 1번 박스 — 조회서에 GUARANTEE 데이터가 있을 때만 ----
+    # 기존 주석(B~F열)과 겹치지 않게 FN 우측(I15~)에 1번 박스를 '그대로' 붙인다.
+    guar = _safe_parse("GUARANTEE(보증) 1번", _cached, parse_guarantee, confirm_xlsx,
+                       "guarantee", default=None)
+    if guar and guar.get("rows"):
+        try:
+            import openpyxl as _ox
+            from generators.fn_guarantee import render_fn_guarantee
+            _wb = _ox.load_workbook(work)
+            if "FN" in _wb.sheetnames:
+                n = render_fn_guarantee(_wb["FN"], guar, start_row=15, start_col=9)
+                _wb.save(work)
+                report.add("생성", "ok", f"FN 보증(GUARANTEE) 1번 박스 반영({n}행)")
+            else:
+                report.add("생성", "warn", "FN 시트 없음 — 보증 박스 미반영")
+        except Exception as e:
+            report.add("생성", "error", f"FN 보증 박스 실패({type(e).__name__}: {e})")
 
     # ---- 양식무결성 HOOK(시각 확인 대체): 생성 후 격자·컬럼·제목 검사 ----
     try:
@@ -481,7 +500,7 @@ def build_special(*, kind, settlement, template, config_dir, config_file, output
         elif kind == "capital":
             from generators.capital import fill_capital
             adj = _cached(parse_adjustments, settlement, "adjustments")
-            res = fill_capital(work, tb_rows, adj, work, cfg)
+            res = fill_capital(work, tb_rows, adj, work, cfg, settlement=settlement)
         elif kind == "cogs":
             from generators.sales import fill_cogs
             res = fill_cogs(work, tb_rows, work, cfg)

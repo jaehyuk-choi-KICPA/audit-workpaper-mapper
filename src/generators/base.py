@@ -28,9 +28,11 @@ def shift_formula_rows(ws, at_row: int, n: int) -> int:
     헤더)을 가리켜 #VALUE!/#DIV/0!/#REF!가 난다. Excel처럼 at_row 이상 행참조를 일괄 +n 한다.
     같은 시트 단순 셀참조(A1·$A$1·범위 양끝)만 대상 — 시트간 참조('시트'!A1)는 `!` 뒤라 제외.
     이후 생성기가 명시적으로 덮어쓰는 셀(본문·합계)은 정상 수식으로 다시 써지므로 무해하다.
+    n이 음수면 행 삭제(delete_rows) 보정: at_row 이상 행참조를 -|n| 이동(삭제구간 아래 행이
+    위로 당겨진 것 반영). 삭제구간 내부를 가리키던 참조는 그대로 둔다(빈 placeholder 삭제 전제).
     Returns: 바뀐 수식 셀 수.
     """
-    if n <= 0:
+    if n == 0:
         return 0
 
     def bump(m):

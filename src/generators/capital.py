@@ -38,7 +38,105 @@ def _copy_style(ws, src_r, dst_r, ncols):
             dc.number_format = sc.number_format
 
 
-def _fill_capital_roman(template, tb_rows, adj_entries, output, cfg, roman_groups):
+def _term_text(blk: dict) -> "str | None":
+    """CE 블록(기수/기간) → '제 19 기 2025년 1월 1일부터 \\n 2025년 12월 31일까지' (템플릿 양식)."""
+    n, rng = blk.get("기수"), blk.get("기간")
+    if not (n and rng):
+        return None
+    return f"제 {n} 기 {rng[0]}부터 \n {rng[1]}까지"
+
+
+def _fill_appropriation(ws, ce: "dict | None", bcol="D", ecol="E", acol="H") -> int:
+    """이익잉여금처분계산서: 제N기 연도헤더 + **당기 칼럼의 미처분 흐름**만 자동 채운다.
+
+    설계(사용자 확정):
+      · 연도/기수 헤더(제N기 YYYY) ← CE(자본변동표) B4/B5. 당기·전기 두 라벨 교체(잔재 교정).
+      · 당기 전기이월미처분 = 총괄표 **미처분이익잉여금 leaf 기초**(천원). 당기순이익 = 미처분 leaf
+        **증감(기말−기초+수정)**(천원). → 차기이월(=합계 수식) 이 자동으로 총괄표 미처분 수정후와 **대사**.
+        (CE '이익잉여금' 열은 미처분+적립금 **총액**이라 미처분-only와 안 맞음 → CE는 헤더에만 사용.)
+      · 전기 칼럼(제N-1기)은 **자동 채우지 않고 비운다**(수기 — 전기조서 영역). 잔재 방지로 값만 클리어.
+      · 처분일자(처분예정일/확정일)는 보존(제N기 정규식이 안 잡음).
+    행은 절대행이 아니라 **과목 라벨 앵커**로 찾는다(로마자 행삽입에도 견고).
+
+    A열 제외(필수): A열은 [수치]/[멘트] 가이드 마커 규약 전용이라 '차기이월미처분이익잉여금'·'이익준비금
+    적립' 같은 계정어를 담아, 포함하면 라벨 매칭·섹션앵커를 가로채 오염시킨다 → 라벨 스캔은 B열(=2)부터.
+    """
+    if not ce:
+        return 0
+    LBL0 = 2
+
+    # ── 0) 섹션 앵커 ──
+    start_row = None
+    for r in range(1, ws.max_row + 1):
+        if "이익잉여금처분계산서" in _norm("".join(str(ws.cell(r, c).value or "") for c in range(LBL0, 6))):
+            start_row = r
+            break
+    if start_row is None:
+        return 0
+
+    # ── 1) 연도/기수 헤더(제 N 기 YYYY) 두 셀: 당기=첫째, 전기=둘째 ──
+    term_cells = []
+    for r in range(start_row, ws.max_row + 1):
+        for c in range(LBL0, min(ws.max_column, 10) + 1):
+            v = ws.cell(r, c).value
+            if v and re.search(r"제\s*\d+\s*기.*\d{4}", str(v)):
+                term_cells.append((r, c))
+    cur_txt = _term_text(ce.get("당기") or {})
+    prev_txt = _term_text(ce.get("전기") or {})
+    if len(term_cells) >= 1 and cur_txt:
+        ws.cell(*term_cells[0]).value = cur_txt
+    if len(term_cells) >= 2 and prev_txt:
+        ws.cell(*term_cells[1]).value = prev_txt
+    n = 1 if term_cells else 0
+
+    # ── 2) 당기/전기 칼럼 위치(과목 헤더행의 '당기'·'전기') ──
+    cur = pv_sub = hdr_row = None
+    for r in range(start_row, min(start_row + 8, ws.max_row + 1)):
+        for c in range(LBL0, min(ws.max_column, 14) + 1):
+            t = _norm(ws.cell(r, c).value)
+            if t == "당기" and cur is None:
+                cur, hdr_row = c, r
+            elif t == "전기" and pv_sub is None:
+                pv_sub, hdr_row = c, r
+    if not cur:
+        return n
+
+    # ── 3) 총괄표 미처분이익잉여금 leaf 행(섹션 위) ──
+    mip = None
+    for r in range(1, start_row):                      # 이름 열만(B·C) — 값 열 숫자 제외
+        lab = _norm("".join(str(ws.cell(r, c).value or "") for c in range(LBL0, 4)))
+        if lab.endswith("미처분이익잉여금") and "이월" not in lab and lab[:1] not in _ROMAN:
+            mip = r                                    # 마지막(가장 아래) 매칭 = 본문 leaf
+
+    # ── 4) 본문 행 순회: 당기 전기이월·당기순이익만 채우고, 전기 칼럼 값은 클리어(수기) ──
+    end_row = ws.max_row
+    for r in range(start_row, ws.max_row + 1):
+        rl = _norm("".join(str(ws.cell(r, c).value or "") for c in range(LBL0, cur)))
+        if not rl:
+            continue
+        if mip and "전기이월미처분이익잉여금" in rl:
+            ws.cell(r, cur).value = f"=ROUND({bcol}{mip}/1000,0)"               # 미처분 leaf 기초
+            ws.cell(r, cur).number_format = _NUMF
+            n += 1
+        elif mip and "당기순이익" in rl:
+            ws.cell(r, cur).value = f"=ROUND((({ecol}{mip}-{bcol}{mip})+{acol}{mip})/1000,0)"  # 미처분 증감
+            ws.cell(r, cur).number_format = _NUMF
+            n += 1
+        if "차기이월미처분이익잉여금" in rl:
+            end_row = r                                # 전기 클리어 종료 = 차기이월 행
+            break
+
+    # 전기 칼럼(sub+roman) 값 클리어 — 타사/전기 잔재 제거, 수기 입력용 빈칸(테두리 보존).
+    # 과목 헤더행(='전기' 라벨)은 보존: 헤더 아래(hdr_row+1)부터 차기이월행까지만 비운다.
+    if pv_sub and hdr_row:
+        for r in range(hdr_row + 1, end_row + 1):
+            for c in (pv_sub, pv_sub + 1):
+                if ws.cell(r, c).value is not None:
+                    ws.cell(r, c).value = None
+    return n
+
+
+def _fill_capital_roman(template, tb_rows, adj_entries, output, cfg, roman_groups, ce=None):
     """로마자 분류 그룹핑 방식(사용자 지정): 자본 flag 계정을 로마자(Ⅰ~Ⅴ)에 매칭해 그 아래
     leaf로 동적 렌더(누락 계정 자동 편입). leaf 라벨에 의존하지 않는다. 로마자 SUM은 멤버로 재작성,
     자본총계 등 절대참조는 행삽입 시 shift_formula_rows로 보정. 로마자 처리는 **아래→위**(삽입이
@@ -140,9 +238,10 @@ def _fill_capital_roman(template, tb_rows, adj_entries, output, cfg, roman_group
     for col in (bcol, ecol, "E", acol, "H"):
         cur = ws.column_dimensions[col].width or 0
         ws.column_dimensions[col].width = max(cur, 16)
+    n_appr = _fill_appropriation(ws, ce, bcol=bcol, ecol=ecol, acol=acol)  # 이잉처분계산서 전기칼럼·헤더
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output)
-    return {"n_filled": n_filled, "re_adj": re_adj, "mode": "roman"}
+    return {"n_filled": n_filled, "re_adj": re_adj, "mode": "roman", "n_appr": n_appr}
 
 
 def _common_prefix(a: str, b: str) -> int:
@@ -155,15 +254,26 @@ def _common_prefix(a: str, b: str) -> int:
     return n
 
 
-def fill_capital(template: str, tb_rows: list, adj_entries: list, output: str, cfg: dict) -> dict:
+def fill_capital(template: str, tb_rows: list, adj_entries: list, output: str, cfg: dict,
+                 settlement: "str | None" = None) -> dict:
     """자본 총괄표를 정산표로 in-place 리필한다.
 
     cfg: {sheet, header_row, data_end_anchor, name_col, base_col, end_col, adj_col}
     roman_groups가 있으면 로마자 분류 그룹핑 방식(_fill_capital_roman)으로 동적 렌더(누락 계정 편입).
+    settlement: 정산표 경로(주어지면 CE 시트=자본변동표에서 이익잉여금처분계산서 전기칼럼·연도헤더를 채움).
     """
+    ce = None
+    if settlement:
+        try:
+            from extractors.equity_changes import parse_equity_changes
+            ce = parse_equity_changes(settlement, cfg.get("ce_sheet", "CE"))
+        except Exception as e:                          # 부분 실패 허용 — 자본 총괄표는 정상 생성
+            import warnings
+            warnings.warn(f"[자본 이잉처분계산서] CE 파싱 실패: {type(e).__name__}: {e}")
+
     roman_groups = cfg.get("roman_groups")
     if roman_groups:
-        return _fill_capital_roman(template, tb_rows, adj_entries, output, cfg, roman_groups)
+        return _fill_capital_roman(template, tb_rows, adj_entries, output, cfg, roman_groups, ce=ce)
 
     sheet = cfg["sheet"]
     nci = cfg.get("name_col", 2)        # 계정명 열(1-indexed)
@@ -229,7 +339,8 @@ def fill_capital(template: str, tb_rows: list, adj_entries: list, output: str, c
         cur = ws.column_dimensions[col].width or 0
         ws.column_dimensions[col].width = max(cur, 16)
 
+    n_appr = _fill_appropriation(ws, ce, bcol=bcol, ecol=ecol, acol=acol)  # 이잉처분계산서 전기칼럼·헤더
     Path = __import__("pathlib").Path
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output)
-    return {"n_filled": n_filled, "re_adj": re_adj}
+    return {"n_filled": n_filled, "re_adj": re_adj, "n_appr": n_appr}

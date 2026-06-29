@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 """A-0(현금및현금성자산, 장단기금융상품) 개별시트 채움 — 쉬운 실행기 (비전문가용 대화형).
 
-★ 총괄표는 만들지 않는다 — **조서생성.exe가 이미 만든 A-0(총괄표 채워진 것)** 를 읽어,
-  그 총괄표에 **연동**해 A-0 전용 개별시트만 동적 구성한다(중복 생성 방지):
-  · A050 주석    : 총괄표 계정 수정후/기초를 =ROUND(!/1000,0) 참조(이름매칭, 없는 계정 skip)
-  · A020 실사    : 기말환율표(참고자료) + 외화 원금×환율 가이드
-  · 보험가입현황 : 조회서 INSURANCE 해약환급금 per-policy 매핑
+**자체완결**: 정산표로 A-0 총괄표를 직접 만들고(조서생성의 A-0 항목만 결합 — 단독 검증 가능),
+그 총괄표에 **연동**해 개별시트를 동적 구성한다:
+  · 총괄표 5)장기금융 : 조회서 보험사 ↔ 거래처원장 잔액(이름매칭) → 잔액/해약환급금/차액
+  · 총괄표 4)단기금융 : INVESTMENT 평가액(확정기여형 DC=외부적립퇴직급여 제외) — 있을 때만(prune)
+  · A050 주석         : 총괄표 계정 수정후/기초를 =ROUND(!/1000,0) 참조(이름매칭)
+  · A020 실사         : 기말환율표(참고자료) + 외화 원금×환율 가이드
+  · 보험가입현황      : 조회서 INSURANCE 해약환급금 per-policy 매핑
 
-사용 순서:
-  1) 먼저 **조서생성.exe**로 총괄표를 만든다 → `출력조서/{회사명}/A-0_4000_현금및현금성자산.xlsx`
-  2) `입력자료/`에 금융기관조회서를 둔다(보험가입현황용 — 없으면 빈 표).
+사용:
+  1) `입력자료/`에 정산표(필수)·금융기관조회서·거래처원장(잔액)을 넣는다.
+  2) `양식자료/`에 A-0 템플릿(A-0_4000_template_현금및현금성자산.xlsx)을 둔다.
   3) `A-0생성.bat` 더블클릭 (또는 python src/easy_run_a0.py)
-  4) 회사명 입력 → 위 A-0 파일에 개별시트가 채워진다(완성본 보존 graft).
+  4) 회사명·기준일·작성자·검토자 입력 → `출력조서/{회사}/`에 A-0 생성(완성본 보존 graft).
 """
 import glob
 import io
@@ -31,10 +33,13 @@ except Exception:
     pass
 
 import openpyxl
+from pipeline import build_lead_all
 from extractors import load_fx_rates
 from generators.sheet_surgery import graft_sheet
 from generators import a0_detail
 
+# A-0 총괄표 생성용 레지스트리(조서생성의 A-0 항목만 따옴 — 단독 실행 가능하게 결합)
+_A0 = {"code": "A-0", "config": "a0.yaml", "template": "A-0_4000_template_현금및현금성자산.xlsx"}
 TOTAL_SHEET = "4000_A000 총괄표"
 A050_SHEET = "A050_주석검토"
 A020_SHEET = "A020_금융자산 실사"
@@ -162,35 +167,50 @@ def _find_a0_outputs():
 
 def main():
     _line("=" * 56)
-    _line("  A-0 개별시트 채움 (총괄표 연동 — 보험가입현황·A020·A050)")
+    _line("  A-0 현금및현금성자산 조서 생성 (총괄표 + 개별시트 · 단독 실행)")
     _line("=" * 56)
-    for d in (INPUT_DIR, PARSED_DIR, OUTPUT_DIR, REF_DIR):
+    for d in (INPUT_DIR, PARSED_DIR, TEMPLATE_DIR, OUTPUT_DIR, REF_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
-    a0s = _find_a0_outputs()
-    if not a0s:
-        _line("\n[안내] 조서생성으로 만든 A-0 파일을 찾지 못했습니다.")
-        _line("       먼저 '조서생성'으로 총괄표를 만든 뒤 이 프로그램을 실행하세요.")
-        _line(f"       (확인 위치: {OUTPUT_DIR}\\{{회사명}}\\A-0_4000_현금및현금성자산.xlsx)")
+    settlement = _find("*정산표*.xls*")
+    if not settlement:
+        _line(f"\n[안내] 정산표를 찾지 못했습니다(파일명에 '정산표' 포함). 입력자료에 넣어 주세요:\n  {INPUT_DIR}")
         return 2
-    if len(a0s) == 1:
-        a0_path = a0s[0]
-    else:
-        _line("\n[A-0 파일이 여러 개] 회사명을 입력해 선택하세요:")
-        for h in a0s:
-            _line("   - " + str(Path(h).parent.name))
-        company = _ask("회사명")
-        sel = [h for h in a0s if Path(h).parent.name == company]
-        if not sel:
-            _line("  해당 회사 A-0를 못 찾았습니다."); return 2
-        a0_path = sel[0]
-    out_dir = Path(a0_path).parent
-    _line(f"\n[A-0 대상] {a0_path}")
-
+    tpl = TEMPLATE_DIR / _A0["template"]
+    if not tpl.exists():
+        _line(f"\n[안내] A-0 템플릿이 없습니다: {tpl}")
+        return 2
     confirm = _find("*조회서*기말감사*.xls*") or _find("필수자료2*") or _find("*금융기관조회서*.xls*")
     ledger = _find("필수자료3*") or _find("*잔액*.xls*") or _find("*거래처원장*.xls*")
+    _line(f"\n[정산표]   {Path(settlement).name}")
     _line(f"[조회서]   {Path(confirm).name if confirm else '없음 — 장기금융/보험가입현황 생략'}")
     _line(f"[잔액원장] {Path(ledger).name if ledger else '없음 — 장기금융 잔액 매칭 생략'}")
+
+    _line("\n[회사 정보 입력]")
+    company = _ask("회사명", example="주식회사 OO")
+    date = _ask("기준일", example="2025-12-31")
+    preparer = _ask("작성자(Preparer)", example="CJH")
+    reviewer = _ask("검토자(Reviewer)", required=False, example="KHK")
+
+    out_dir = OUTPUT_DIR / company
+    _line("\n총괄표 생성 중...\n")
+    try:
+        build_lead_all(
+            settlement=settlement, registry=[_A0], config_dir=str(CONFIG_DIR),
+            template_root=str(TEMPLATE_DIR), output_dir=str(out_dir),
+            parsed_dir=str(PARSED_DIR / company),
+            params={"회사명": company, "날짜": date, "preparer": preparer, "reviewer": reviewer},
+        )
+    except PermissionError:
+        _line(f"\n[오류] 출력 파일이 열려 있습니다. 닫고 다시 실행해 주세요:\n  {out_dir}")
+        return 1
+    except Exception as e:
+        _line(f"\n[오류] 총괄표 생성 실패: {type(e).__name__}: {e}")
+        return 1
+    a0_path = str(out_dir / _A0["template"].replace("_template_", "_"))
+    if not os.path.exists(a0_path):
+        _line("\n[오류] 총괄표 산출물이 없습니다."); return 1
+    _line(f"[총괄표] {a0_path}\n개별시트 채우는 중...")
 
     tmp = str(out_dir / "_tmp_a0")
     Path(tmp).mkdir(parents=True, exist_ok=True)

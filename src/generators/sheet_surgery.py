@@ -58,6 +58,69 @@ def _sheet_part(zf: zipfile.ZipFile, sheet_name: str) -> "str | None":
     return None
 
 
+def trim_blank_tail(full_path: str, sheet_name: str, output_path: str = None,
+                    margin: int = 40) -> int:
+    """대상 시트의 **내용 없는 꼬리 행**(빈 styled 행)을 zip/XML 레벨로 잘라낸다(스타일·다른 시트 무손실).
+
+    회계법인 완성본은 일부 시트가 dimension이 수십만 행으로 부풀어(빈 styled 행 누적) 100MB+가 되어
+    openpyxl 로드/저장이 분 단위로 느려진다. 실제 값(`<v>`/`<f>`/`<is>`)이 있는 마지막 행 + margin
+    까지만 남기고 그 아래 빈 행을 제거(+dimension 축소)한다. 클린 시트엔 사실상 무영향(전 행 보존).
+    openpyxl로 열지 않아 컨트롤·매크로·도형 보존. output_path 생략 시 제자리. Returns: 제거한 행 수.
+    """
+    output_path = output_path or full_path
+    with zipfile.ZipFile(full_path) as zf:
+        part = _sheet_part(zf, sheet_name)
+        if part is None:
+            raise ValueError(f"[trim] 시트 '{sheet_name}' 없음")
+        data = {n: zf.read(n) for n in zf.namelist()}
+
+    sheet = data[part]
+    head, sd_open, rest = sheet.partition(b"<sheetData>")
+    if not sd_open:                                   # <sheetData/> 빈 시트 등
+        if output_path != full_path:
+            shutil.copyfile(full_path, output_path)
+        return 0
+    body, sd_close, tail = rest.partition(b"</sheetData>")
+
+    chunks = body.split(b"<row ")                     # chunks[0]=선두공백, 이후 각 행(접두 제외)
+    last_content = 0
+    parsed = []                                       # (rnum, has_content, raw_chunk)
+    for ch in chunks[1:]:
+        try:
+            rnum = int(ch.split(b'"', 2)[1])          # r="N"
+        except (IndexError, ValueError):
+            parsed.append((None, True, ch))           # 파싱 불가 → 보존
+            continue
+        has = (b"<v" in ch) or (b"<f" in ch) or (b"<is" in ch)
+        if has:
+            last_content = max(last_content, rnum)
+        parsed.append((rnum, has, ch))
+
+    keep = last_content + margin
+    kept = [chunks[0]]
+    removed = 0
+    for rnum, _has, ch in parsed:
+        if rnum is not None and rnum > keep:
+            removed += 1
+            continue
+        kept.append(b"<row " + ch)
+    new_body = b"".join(kept)
+
+    sheet = head + sd_open + new_body + sd_close + tail
+    # dimension 축소(열 범위는 보존, 행만 keep로)
+    sheet = re.sub(rb'(<dimension ref="[A-Z]+\d+:[A-Z]+)\d+"',
+                   lambda m: m.group(1) + str(keep).encode() + b'"', sheet, count=1)
+    data[part] = sheet
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(output_path) + ".tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+        for n, b in data.items():
+            out.writestr(n, b)
+    os.replace(tmp, output_path)
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # styles.xml 병합 (문자열 조작 — 네임스페이스 mc/x14 등 원형 보존; ET 재직렬화는
 # 이 특수 네임스페이스를 ns0/ns1로 변질시켜 Excel이 파일을 거부함 → 실측 확인)

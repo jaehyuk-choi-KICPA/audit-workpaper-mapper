@@ -164,6 +164,19 @@ def cached_ideal_ledger(source_path: str, parsed_dir: str, config_dir: str) -> l
     return read_ideal_ledger(str(cached))
 
 
+def cached_ideal_journal(source_path: str, parsed_dir: str) -> list[dict]:
+    """분개장 → 이상적 분개장 양식(`parse_journal`)으로 변환·캐시(소스 해시 기반 JSON).
+
+    거래처원장(`cached_ideal_ledger`)과 동일한 **이상적 중간다리 원칙** — 개별조서(BBDD 이자비용 등)는
+    raw 분개장을 직접 다루지 않고 이 캐시된 이상적 라인만 소비한다. 정산표 매핑 조서생성 시 1회 생성돼
+    여러 조서가 공유(분개장은 24만행+ 대용량이라 JSON 캐시로 재파싱 제거). 이상적 라인 스키마:
+    {날짜, 번호, 계정과목, 거래처, 적요, 차변, 대변}.
+    """
+    from extractors.journal import parse_journal
+    return load_with_cache(source_path, parse_journal,
+                           cache_dir=parsed_dir, tag="ideal_journal")
+
+
 def _build_cash_resolver(parsed_dir: str):
     """잔액 스냅샷 헤더가 C-1차로 안 잡힐 때만 쓰는 C-2차 마스킹 LLM 폴백 resolver.
 
