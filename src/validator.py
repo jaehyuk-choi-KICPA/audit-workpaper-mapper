@@ -290,10 +290,11 @@ def validate_detail_blocks(path: str, sheet_name: str, *, expected_blocks: int,
             if any(e in v for e in ("#REF!", "#NAME?", "#VALUE!", "#DIV/0!")):
                 err_cells.append(f"{ws.cell(r, c).coordinate}={v}")
 
-    if len(tie_rows) != expected_blocks:
-        issues.append(f"[블록수] {sheet_name} tie-out {len(tie_rows)}개 ≠ 계정 {expected_blocks}개")
-    if len(chk_rows) < expected_blocks:
-        issues.append(f"[Check] {sheet_name} Check행 {len(chk_rows)}개 < 계정 {expected_blocks}개")
+    n_tie, n_chk = len(set(tie_rows)), len(set(chk_rows))   # 한 행에 라벨이 여러 열 → 행 단위 dedup
+    if n_tie != expected_blocks:
+        issues.append(f"[블록수] {sheet_name} tie-out {n_tie}개 ≠ 계정 {expected_blocks}개")
+    if n_chk < expected_blocks:
+        issues.append(f"[Check] {sheet_name} Check행 {n_chk}개 < 계정 {expected_blocks}개")
 
     # tie-out 행이 lead_sheet를 참조하는지
     for r in set(tie_rows):

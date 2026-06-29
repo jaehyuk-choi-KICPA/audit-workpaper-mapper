@@ -20,7 +20,7 @@ from extractors import (
     parse_cs,
     parse_bank, parse_bank_loans, parse_bank_collateral,
     parse_insurance, parse_invest, parse_invest_eval,
-    parse_guarantee,
+    parse_guarantee, parse_longterm_groups,
 )
 from generators import (
     A100Generator, A200Generator, build_a200_data,
@@ -141,7 +141,7 @@ def build_a1(*, control_sheet, ledger_src, confirm_xlsx, template, config_dir,
     cs_rows = _safe_parse("발송 Control Sheet", _cached, parse_cs, control_sheet, "cs")
     ledger_rows = _safe_parse("거래처원장/결산보고서", cached_ideal_ledger, ledger_src, parsed, str(cfg))
     bank_rows = _safe_parse("BANK(현금성/퇴직)", _cached, parse_bank, confirm_xlsx, "bank")
-    ins_groups = _safe_parse("INSURANCE(장기금융)", _cached, parse_insurance, confirm_xlsx, "insurance")
+    ins_groups = _safe_parse("장기금융(INSURANCE+해약환급금 스캔)", _cached, parse_longterm_groups, confirm_xlsx, "longterm")
     invest_rows = _safe_parse("INVESTMENT(단기금융)", _cached, parse_invest, confirm_xlsx, "invest")
     invest_eval = _safe_parse("INVESTMENT 2번(평가액)", _cached, parse_invest_eval, confirm_xlsx, "invest_eval")
     loan_rows = _safe_parse("대출(BANK 2-2)", _cached, parse_bank_loans, confirm_xlsx, "loans")

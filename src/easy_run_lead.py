@@ -31,30 +31,12 @@ except Exception:
 
 from pipeline import build_lead_all
 from run_lead_all import REGISTRY
+from workspace import select_workspace, template_dir, config_dir, prompt_company_info
 
-
-def _base_dir() -> Path:
-    """프로그램 루트. .exe(frozen)면 실행파일 폴더, 스크립트면 프로젝트 루트."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE = _base_dir()
-
-# 사용자-대면 5폴더 = 배포 루트 최상위. 환경변수(A1_*_DIR)로 재정의 가능(A-1과 공유).
-INPUT_DIR    = Path(os.environ.get("A1_INPUT_DIR",    BASE / "입력자료"))
-PARSED_DIR   = Path(os.environ.get("A1_PARSED_DIR",   BASE / "변환자료"))
-TEMPLATE_DIR = Path(os.environ.get("A1_TEMPLATE_DIR", BASE / "양식자료"))
-OUTPUT_DIR   = Path(os.environ.get("A1_OUTPUT_DIR",   BASE / "출력조서"))
-
-# config(셀 매핑) = 프로그램 내부 자산. 스크립트=_internal/config, .exe=내장(_MEIPASS).
-CONFIG_DIR = Path(getattr(sys, "_MEIPASS", str(BASE))) / "_internal" / "config"
-# 개발(스크립트) 환경: 양식자료가 비어 있으면 _internal/양식을 사용.
-if not getattr(sys, "frozen", False) and not list(TEMPLATE_DIR.glob("*.xls*")):
-    _dev = BASE / "_internal" / "양식"
-    if _dev.exists():
-        TEMPLATE_DIR = _dev
+# 양식·config = 회사 무관 공유 자산. 입력·변환·출력은 회사별 워크스페이스에서 받는다.
+TEMPLATE_DIR = template_dir()
+CONFIG_DIR = config_dir()
+INPUT_DIR = None  # main()에서 워크스페이스로 설정
 
 
 def _line(msg=""):
@@ -70,9 +52,9 @@ def _ask(label: str, required: bool = True, example: str = "") -> str:
         _line("  ▷ 값을 입력해 주세요.")
 
 
-def _find_settlement() -> "str | None":
+def _find_settlement(input_dir: Path) -> "str | None":
     """입력자료에서 정산표 엑셀을 찾는다(파일명에 '정산표' 포함, 임시파일 제외)."""
-    cands = [h for h in glob.glob(str(INPUT_DIR / "**" / "*정산표*.xls*"), recursive=True)
+    cands = [h for h in glob.glob(str(input_dir / "**" / "*정산표*.xls*"), recursive=True)
              if "~$" not in h]
     return sorted(cands)[0] if cands else None
 
@@ -82,13 +64,16 @@ def main():
     _line("  정산표 기반 조서 총괄표 일괄 생성")
     _line("=" * 56)
 
-    for d in (INPUT_DIR, PARSED_DIR, TEMPLATE_DIR, OUTPUT_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+    ws = select_workspace(line=_line)
+    if ws is None:
+        return 2
+    TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
+    _line(f"\n[회사] {ws.company}   (작업폴더: {ws.input_dir.parent})")
 
-    settlement = _find_settlement()
+    settlement = _find_settlement(ws.input_dir)
     if not settlement:
         _line("\n[안내] 정산표 파일을 찾지 못했습니다(파일명에 '정산표' 포함).")
-        _line(f"       아래 폴더에 정산표를 넣고 다시 실행해 주세요:\n       {INPUT_DIR}")
+        _line(f"       아래 폴더에 정산표를 넣고 다시 실행해 주세요:\n       {ws.input_dir}")
         return 2
     _line(f"\n[정산표] {Path(settlement).name}")
 
@@ -103,12 +88,10 @@ def main():
         return 2
 
     _line("\n[회사 정보 입력]")
-    company  = _ask("회사명", example="주식회사 OO")
-    date     = _ask("기준일", example="2025-12-31")
-    preparer = _ask("작성자(Preparer)", example="CJH")
-    reviewer = _ask("검토자(Reviewer)", required=False, example="KHK")
+    company  = ws.company
+    date, preparer, reviewer = prompt_company_info(ws, input, _line)
 
-    out_dir = OUTPUT_DIR / company
+    out_dir = ws.output_dir
     _line("\n생성 중... (조서별 추출→매핑→이식, 수십 초 소요될 수 있습니다)\n")
     n_total = len(present)
     counter = {"n": 0}
@@ -122,7 +105,7 @@ def main():
         reports, comp = build_lead_all(
             settlement=settlement, registry=present, config_dir=str(CONFIG_DIR),
             template_root=str(TEMPLATE_DIR), output_dir=str(out_dir),
-            parsed_dir=str(PARSED_DIR / company),   # 변환자료/{회사명}/ — 출력조서와 분리
+            parsed_dir=str(ws.parsed_dir),   # 작업/{회사}/변환자료 — 회사별 격리
             params={"회사명": company, "날짜": date, "preparer": preparer, "reviewer": reviewer},
             progress=_progress,
         )
@@ -166,7 +149,7 @@ def main():
     summary = "\n".join(lines)
     _line("\n" + summary)
 
-    report_path = out_dir / f"{company}_실행리포트.txt"
+    report_path = out_dir / "조서생성_실행리포트.txt"
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         report_path.write_text(summary, encoding="utf-8")

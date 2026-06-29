@@ -12,9 +12,10 @@ from .fixed_asset_memo import parse_memo, find_memo, load_memo
 from .fixed_asset_ledger import parse_fixed_asset_ledger
 from .cf_depreciation import parse_cf_depreciation
 from .fixed_asset_movements import parse_fixed_asset_movements, extract_fixed_asset_movements
-from .journal import parse_journal
+from .journal import parse_journal, write_ideal_journal
 from .equity_changes import parse_equity_changes
 from .guarantee import parse_guarantee
+from .surrender import parse_surrender_value, parse_longterm_groups
 
 __all__ = [
     "parse_ledger", "write_ideal_ledger", "read_ideal_ledger",
@@ -25,6 +26,7 @@ __all__ = [
     "parse_fx_memo", "find_fx_memo", "load_fx_rates",
     "parse_memo", "find_memo", "load_memo",
     "parse_fixed_asset_ledger", "parse_cf_depreciation",
-    "parse_fixed_asset_movements", "extract_fixed_asset_movements", "parse_journal",
+    "parse_fixed_asset_movements", "extract_fixed_asset_movements", "parse_journal", "write_ideal_journal",
     "parse_equity_changes", "parse_guarantee",
+    "parse_surrender_value", "parse_longterm_groups",
 ]

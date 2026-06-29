@@ -296,11 +296,66 @@ def _text_overrides(cap: dict, donor_acct: str, name: str) -> dict:
     return ov
 
 
+def _detect_unit_geometry(ws, u: dict) -> "dict | None":
+    """도너 유닛(첫 계정 블록) 기하를 라벨로 자동탐지 — 회계법인마다 CC200 행 위치가 달라
+    하드코딩 절대행은 깨진다(도너 캡처가 옆 유닛까지 삼켜 tie행 중복 등). 탐지 실패 시 None."""
+    tci = _col(u["title_col"])
+    maxr = ws.max_row or 1
+    title_re = re.compile(r"^\s*\d+\.\s*\S")
+
+    def is_title(r):
+        v = ws.cell(r, tci).value
+        return isinstance(v, str) and bool(title_re.match(v))
+
+    us = next((r for r in range(1, maxr + 1) if is_title(r)), None)
+    if us is None:
+        return None
+    nxt = next((r for r in range(us + 1, maxr + 1) if is_title(r)), None)
+
+    def find(label, cols, start, end):
+        t = _norm(label)
+        for r in range(start, (end or maxr) + 1):
+            for c in cols:
+                v = ws.cell(r, c).value
+                if isinstance(v, str) and t and t in _norm(v):
+                    return r
+        return None
+
+    end_bound = (nxt - 1) if nxt else maxr
+    sub = find("합계", (3, 4), us + 1, end_bound)
+    if sub is None:
+        return None
+    tie = find("총괄표", (3, 4), sub + 1, end_bound)
+    chk = find("Check", (3, 4), (tie or sub) + 1, end_bound)
+    # Nature 헤더: us~합계 사이, 기초·기말(또는 전기·잔액) 라벨이 있는 행
+    hdr = None
+    for r in range(us + 1, sub):
+        labs = [_norm(ws.cell(r, c).value) for c in range(1, (ws.max_column or 1) + 1)]
+        if any(("기초" in x or "전기" in x) for x in labs) and \
+           any(("기말" in x or "잔액" in x) for x in labs):
+            hdr = r
+            break
+    if hdr is None:
+        hdr = max(us + 1, sub - 2)
+    ue = (nxt - 1) if nxt else ((chk or tie or sub) + 2)
+    return {
+        "unit_start": us, "unit_end": ue, "header_row": hdr,
+        "data_donor_row": hdr + 1, "data_placeholder_end": sub - 1,
+        "subtotal_donor_row": sub,
+        "tie_donor_row": tie or (sub + 2),
+        "check_donor_row": chk or ((tie or sub) + 1),
+    }
+
+
 def render_cc200(ws, cfg: dict, accounts: list, by_ledger: dict) -> dict:
-    """CC200 — 총괄표 계정마다 미지급금 도너 유닛(3서브섹션)을 통째 스탬프. Returns 진단 dict."""
+    """CC200 — 총괄표 계정마다 도너 유닛(3서브섹션)을 통째 스탬프. Returns 진단 dict."""
     g = _gen(ws)
     lead = cfg["lead"]
-    u = cfg["unit"]
+    # 유닛 기하는 라벨로 자동탐지(템플릿 버전 무관). 탐지 실패 시 config 값 폴백.
+    u = dict(cfg["unit"])
+    geo = _detect_unit_geometry(ws, u)
+    if geo:
+        u.update(geo)
     ref = _sheet_ref(lead["sheet"])
     us, ue = u["unit_start"], u["unit_end"]
     hr, dd = u["header_row"], u["data_donor_row"]

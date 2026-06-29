@@ -46,22 +46,12 @@ R_NOTES = "주석검토"
 S_LEAD = "S100_총괄표"
 
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
+from workspace import select_workspace, template_dir, config_dir, prompt_company_info
 
-
-BASE = _base_dir()
-INPUT_DIR = Path(os.environ.get("A1_INPUT_DIR", BASE / "입력자료"))
-PARSED_DIR = Path(os.environ.get("A1_PARSED_DIR", BASE / "변환자료"))
-TEMPLATE_DIR = Path(os.environ.get("A1_TEMPLATE_DIR", BASE / "양식자료"))
-OUTPUT_DIR = Path(os.environ.get("A1_OUTPUT_DIR", BASE / "출력조서"))
-CONFIG_DIR = Path(getattr(sys, "_MEIPASS", str(BASE))) / "_internal" / "config"
-if not getattr(sys, "frozen", False) and not list(TEMPLATE_DIR.glob("*.xls*")):
-    _dev = BASE / "_internal" / "양식"
-    if _dev.exists():
-        TEMPLATE_DIR = _dev
+# 양식·config = 회사 무관 공유 자산. 입력·변환·출력은 회사별 워크스페이스에서 받는다.
+TEMPLATE_DIR = template_dir()
+CONFIG_DIR = config_dir()
+INPUT_DIR = PARSED_DIR = OUTPUT_DIR = None  # main()에서 워크스페이스로 설정
 
 
 def _line(m=""):
@@ -137,8 +127,14 @@ def main():
     _line("=" * 56)
     _line("  R(판관비)·S(기타손익) 조서 생성 — 정산표 조서생성 후속")
     _line("=" * 56)
-    for d in (INPUT_DIR, PARSED_DIR, TEMPLATE_DIR, OUTPUT_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+
+    global INPUT_DIR, PARSED_DIR, OUTPUT_DIR
+    ws = select_workspace(line=_line)
+    if ws is None:
+        return 2
+    INPUT_DIR, PARSED_DIR, OUTPUT_DIR = ws.input_dir, ws.parsed_dir, ws.output_dir
+    TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
+    _line(f"\n[회사] {ws.company}   (작업폴더: {ws.input_dir.parent})")
 
     settlement = _find("*정산표*.xls*")
     if not settlement:
@@ -155,26 +151,29 @@ def main():
         return 2
 
     _line("\n[회사 정보 입력]")
-    company = _ask("회사명", example="주식회사 OO")
-    date = _ask("기준일", example="2025-12-31")
-    preparer = _ask("작성자(Preparer)", example="CJH")
-    reviewer = _ask("검토자(Reviewer)", required=False, example="KHK")
+    company = ws.company
+    date, preparer, reviewer = prompt_company_info(ws, input, _line)
 
-    out_dir = OUTPUT_DIR / company
-    _line("\n총괄표 생성 중...\n")
-    try:
-        build_lead_all(
-            settlement=settlement, registry=present, config_dir=str(CONFIG_DIR),
-            template_root=str(TEMPLATE_DIR), output_dir=str(out_dir),
-            parsed_dir=str(PARSED_DIR / company),
-            params={"회사명": company, "날짜": date, "preparer": preparer, "reviewer": reviewer},
-        )
-    except PermissionError:
-        _line(f"\n[오류] 출력 파일이 열려 있습니다. 닫고 다시 실행해 주세요:\n  {out_dir}")
-        return 1
-    except Exception as e:
-        _line(f"\n[오류] 총괄표 생성 실패: {type(e).__name__}: {e}")
-        return 1
+    out_dir = ws.output_dir
+    # 있으면 그대로 사용(조서생성 산출물 재사용), 없으면 정산표로 직접 생성.
+    if all(os.path.exists(_out_path(out_dir, it)) for it in present):
+        _line("\n[총괄표] 기존 산출물 재사용 (R·S)")
+        _line("        (정산표가 바뀌었으면 '조서생성'을 다시 돌리거나 해당 파일을 지우고 실행)")
+    else:
+        _line("\n총괄표가 없어 정산표로 생성 중...\n")
+        try:
+            build_lead_all(
+                settlement=settlement, registry=present, config_dir=str(CONFIG_DIR),
+                template_root=str(TEMPLATE_DIR), output_dir=str(out_dir),
+                parsed_dir=str(ws.parsed_dir),
+                params={"회사명": company, "날짜": date, "preparer": preparer, "reviewer": reviewer},
+            )
+        except PermissionError:
+            _line(f"\n[오류] 출력 파일이 열려 있습니다. 닫고 다시 실행해 주세요:\n  {out_dir}")
+            return 1
+        except Exception as e:
+            _line(f"\n[오류] 총괄표 생성 실패: {type(e).__name__}: {e}")
+            return 1
 
     pm = rs_detail.read_pm(settlement)
     amounts = rs_detail.lead_amounts(settlement)

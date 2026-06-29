@@ -32,22 +32,12 @@ except Exception:
 from bbdd_pipeline import build_bbdd
 
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
+from workspace import select_workspace, template_dir, config_dir, prompt_company_info
 
-
-BASE = _base_dir()
-INPUT_DIR    = Path(os.environ.get("A1_INPUT_DIR",    BASE / "입력자료"))
-PARSED_DIR   = Path(os.environ.get("A1_PARSED_DIR",   BASE / "변환자료"))
-TEMPLATE_DIR = Path(os.environ.get("A1_TEMPLATE_DIR", BASE / "양식자료"))
-OUTPUT_DIR   = Path(os.environ.get("A1_OUTPUT_DIR",   BASE / "출력조서"))
-CONFIG_DIR = Path(getattr(sys, "_MEIPASS", str(BASE))) / "_internal" / "config"
-if not getattr(sys, "frozen", False) and not list(TEMPLATE_DIR.glob("*.xls*")):
-    _dev = BASE / "_internal" / "양식"
-    if _dev.exists():
-        TEMPLATE_DIR = _dev
+# 양식·config = 회사 무관 공유 자산. 입력·변환·출력은 회사별 워크스페이스에서 받는다.
+TEMPLATE_DIR = template_dir()
+CONFIG_DIR = config_dir()
+INPUT_DIR = PARSED_DIR = OUTPUT_DIR = None  # main()에서 워크스페이스로 설정
 
 
 def _line(msg=""):
@@ -84,8 +74,14 @@ def main():
     _line("=" * 56)
     _line("  BBDD 장단기차입금 조서 단독 생성")
     _line("=" * 56)
-    for d in (INPUT_DIR, PARSED_DIR, TEMPLATE_DIR, OUTPUT_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+
+    global INPUT_DIR, PARSED_DIR, OUTPUT_DIR
+    ws = select_workspace(line=_line)
+    if ws is None:
+        return 2
+    INPUT_DIR, PARSED_DIR, OUTPUT_DIR = ws.input_dir, ws.parsed_dir, ws.output_dir
+    TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
+    _line(f"\n[회사] {ws.company}   (작업폴더: {ws.input_dir.parent})")
 
     settlement = _find("*정산표*.xls*")
     template = _find_template()
@@ -107,20 +103,19 @@ def main():
     _line(f"[분개장] {Path(journal).name if journal else '— (이자비용 비움)'}")
 
     _line("\n[회사 정보 입력]")
-    company  = _ask("회사명", example="주식회사 OO")
-    date     = _ask("기준일", example="2025-12-31")
-    preparer = _ask("작성자(Preparer)", example="CJH")
-    reviewer = _ask("검토자(Reviewer)", required=False, example="KHK")
+    company  = ws.company
+    date, preparer, reviewer = prompt_company_info(ws, input, _line)
 
-    out_dir = OUTPUT_DIR / company
+    out_dir = ws.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    output = out_dir / f"BBDD_장단기차입금_{company}{Path(template).suffix}"
+    # 출력명을 조서생성 규칙(_template_ → _)으로 통일 → 같은 파일 덮어쓰기(중복 파일 방지).
+    output = out_dir / Path(template).name.replace("_template_", "_")
 
     _line("\n생성 중... (조회서·잔액·분개장 파싱 + 5시트 이식, 수십 초 소요)\n")
     try:
         r = build_bbdd(
             template, confirm=confirm, ledger=ledger, settlement=settlement, journal=journal,
-            config_dir=str(CONFIG_DIR), parsed_dir=str(PARSED_DIR / company), output=str(output),
+            config_dir=str(CONFIG_DIR), parsed_dir=str(ws.parsed_dir), output=str(output),
             params={"회사명": company, "날짜": date, "preparer": preparer, "reviewer": reviewer},
         )
     except PermissionError:
@@ -154,7 +149,7 @@ def main():
     summary = "\n".join(lines)
     _line("\n" + summary)
 
-    report_path = out_dir / f"BBDD_{company}_실행리포트.txt"
+    report_path = out_dir / "BBDD_실행리포트.txt"
     try:
         report_path.write_text(summary, encoding="utf-8")
     except Exception:

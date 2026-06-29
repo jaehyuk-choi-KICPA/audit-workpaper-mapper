@@ -29,27 +29,21 @@ except Exception:
     pass
 
 from detail_pipeline import build_detail_all
+from pipeline import build_lead_all
+from run_lead_all import REGISTRY
+from workspace import (select_workspace, config_dir, template_dir,
+                       prompt_company_info)
 
-
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE = _base_dir()
-INPUT_DIR  = Path(os.environ.get("A1_INPUT_DIR",  BASE / "입력자료"))
-PARSED_DIR = Path(os.environ.get("A1_PARSED_DIR", BASE / "변환자료"))
-OUTPUT_DIR = Path(os.environ.get("A1_OUTPUT_DIR", BASE / "출력조서"))
-CONFIG_DIR = Path(getattr(sys, "_MEIPASS", str(BASE))) / "_internal" / "config"
-# 개발(스크립트): 출력조서가 비면 _internal/output 사용
-if not getattr(sys, "frozen", False) and not list(OUTPUT_DIR.glob("*/")):
-    _dev = BASE / "_internal" / "output"
-    if _dev.exists():
-        OUTPUT_DIR = _dev
+# config·양식 = 회사 무관 공유 자산. 입력·변환·출력은 회사별 워크스페이스에서 받는다.
+CONFIG_DIR = config_dir()
+TEMPLATE_DIR = template_dir()
+INPUT_DIR = PARSED_DIR = OUTPUT_DIR = None  # main()에서 워크스페이스로 설정
 
 _LEDGER_PATTERNS = ("필수자료3*.xls*", "*거래처*원장*.xls*", "*거래처*잔액*.xls*",
                     "*잔액*현황*.xls*", "*원장*.xls*", "*잔액*.xls*")
+
+# D·CC 총괄표를 자체 생성하기 위한 레지스트리(조서생성의 D·CC 부분 재사용 → 독립 실행).
+_DCC = [it for it in REGISTRY if it["code"] in ("D", "CC")]
 
 
 def _line(msg=""):
@@ -65,24 +59,30 @@ def _find_ledger():
     return None
 
 
-def _company_dirs():
-    """출력조서 하위에서 D·CC 산출물이 있는 회사 폴더 목록."""
-    out = []
-    for d in sorted(p for p in OUTPUT_DIR.iterdir() if p.is_dir()):
-        has = glob.glob(str(d / "**" / "D_*기타자산*.xls*"), recursive=True) or \
-              glob.glob(str(d / "**" / "CC_*기타부채*.xls*"), recursive=True) or \
-              glob.glob(str(d / "**" / "D_4000_*.xls*"), recursive=True)
-        if has:
-            out.append(d)
-    return out
+def _find_settlement():
+    cands = [h for h in glob.glob(str(INPUT_DIR / "**" / "*정산표*.xls*"), recursive=True)
+             if "~$" not in h]
+    return sorted(cands)[0] if cands else None
+
+
+def _has_dcc(out_dir: Path) -> bool:
+    """출력조서에 1단계 D·CC 산출물이 있는지 확인."""
+    return bool(glob.glob(str(out_dir / "**" / "D_*기타자산*.xls*"), recursive=True) or
+                glob.glob(str(out_dir / "**" / "CC_*기타부채*.xls*"), recursive=True) or
+                glob.glob(str(out_dir / "**" / "D_4000_*.xls*"), recursive=True))
 
 
 def main():
     _line("=" * 56)
     _line("  기타자산(D200)·기타부채(CC200) 상세 시트 생성")
     _line("=" * 56)
-    for d in (INPUT_DIR, PARSED_DIR, OUTPUT_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+
+    global INPUT_DIR, PARSED_DIR, OUTPUT_DIR
+    ws = select_workspace(line=_line)
+    if ws is None:
+        return 2
+    INPUT_DIR, PARSED_DIR, OUTPUT_DIR = ws.input_dir, ws.parsed_dir, ws.output_dir
+    _line(f"\n[회사] {ws.company}   (작업폴더: {ws.input_dir.parent})")
 
     ledger = _find_ledger()
     if ledger:
@@ -91,32 +91,48 @@ def main():
         _line("\n[안내] 거래처원장(잔액명세서)을 찾지 못했습니다(파일명에 '원장'/'잔액' 포함).")
         _line(f"       없으면 거래처별 명세는 비우고 tie/check만 채웁니다. 폴더: {INPUT_DIR}")
 
-    comps = _company_dirs()
-    if not comps:
-        _line("\n[안내] 출력조서에서 1단계 산출물(D·CC 완성본)을 찾지 못했습니다.")
-        _line(f"       먼저 '조서생성'을 돌려 D·CC 총괄표를 만든 뒤 실행하세요. 폴더: {OUTPUT_DIR}")
-        return 2
-    _line(f"[대상 회사] {', '.join(p.name for p in comps)}\n")
+    # D·CC 완성본(총괄표)이 없으면 → 정산표로 직접 선생성(독립 실행). 있으면 그대로 사용.
+    if not _has_dcc(ws.output_dir):
+        settlement = _find_settlement()
+        base = [it for it in _DCC if (TEMPLATE_DIR / it["template"]).exists()]
+        if settlement and base:
+            _line("\n[안내] D·CC 총괄표가 없어 정산표로 먼저 생성합니다(독립 실행).")
+            date, preparer, reviewer = prompt_company_info(ws, input, _line)
+            try:
+                build_lead_all(
+                    settlement=settlement, registry=base, config_dir=str(CONFIG_DIR),
+                    template_root=str(TEMPLATE_DIR), output_dir=str(ws.output_dir),
+                    parsed_dir=str(ws.parsed_dir),
+                    params={"회사명": ws.company, "날짜": date,
+                            "preparer": preparer, "reviewer": reviewer},
+                    progress=lambda code, ok: _line("   [%s] %s 총괄표" % ("V" if ok else "X", code)),
+                )
+            except Exception as e:
+                _line(f"\n[오류] D·CC 총괄표 생성 실패: {type(e).__name__}: {e}")
+                return 1
+        if not _has_dcc(ws.output_dir):
+            _line("\n[안내] D·CC 총괄표를 만들 수 없습니다.")
+            _line(f"       정산표를 입력자료에 넣거나, 먼저 '조서생성'을 돌리세요. 폴더: {ws.output_dir}")
+            return 2
 
     all_reports = {}
-    for comp in comps:
-        _line(f"── {comp.name} 생성 중...")
+    _line(f"── {ws.company} 생성 중...")
 
-        def _progress(code, ok):
-            _line("   [%s] %s" % ("V" if ok else "X", code))
+    def _progress(code, ok):
+        _line("   [%s] %s" % ("V" if ok else "X", code))
 
-        try:
-            reports = build_detail_all(
-                output_root=str(comp), ledger_path=ledger,
-                config_dir=str(CONFIG_DIR),
-                parsed_dir=str(PARSED_DIR / comp.name),
-                progress=_progress)
-            all_reports[comp.name] = reports
-        except PermissionError:
-            _line(f"\n[오류] 출력 파일이 열려 있어 저장할 수 없습니다. 닫고 다시 실행하세요: {comp}")
-            return 1
-        except Exception as e:
-            _line(f"\n[오류] {comp.name}: {type(e).__name__}: {e}")
+    try:
+        reports = build_detail_all(
+            output_root=str(ws.output_dir), ledger_path=ledger,
+            config_dir=str(CONFIG_DIR),
+            parsed_dir=str(ws.parsed_dir),
+            progress=_progress)
+        all_reports[ws.company] = reports
+    except PermissionError:
+        _line(f"\n[오류] 출력 파일이 열려 있어 저장할 수 없습니다. 닫고 다시 실행하세요: {ws.output_dir}")
+        return 1
+    except Exception as e:
+        _line(f"\n[오류] {ws.company}: {type(e).__name__}: {e}")
 
     # 진단 요약
     lines = ["", "=" * 60, "  상세 생성 완료", "=" * 60]

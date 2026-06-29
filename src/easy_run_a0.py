@@ -46,23 +46,12 @@ A020_SHEET = "A020_금융자산 실사"
 HOLD_SHEET = "장기금융상품_보험가입현황"
 
 
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
+from workspace import select_workspace, template_dir, config_dir, prompt_company_info
 
-
-BASE = _base_dir()
-INPUT_DIR = Path(os.environ.get("A1_INPUT_DIR", BASE / "입력자료"))
-PARSED_DIR = Path(os.environ.get("A1_PARSED_DIR", BASE / "변환자료"))
-TEMPLATE_DIR = Path(os.environ.get("A1_TEMPLATE_DIR", BASE / "양식자료"))
-OUTPUT_DIR = Path(os.environ.get("A1_OUTPUT_DIR", BASE / "출력조서"))
-REF_DIR = Path(os.environ.get("A1_REF_DIR", BASE / "참고자료"))
-CONFIG_DIR = Path(getattr(sys, "_MEIPASS", str(BASE))) / "_internal" / "config"
-if not getattr(sys, "frozen", False) and not list(TEMPLATE_DIR.glob("*.xls*")):
-    _dev = BASE / "_internal" / "양식"
-    if _dev.exists():
-        TEMPLATE_DIR = _dev
+# 양식·config = 회사 무관 공유 자산. 입력·변환·참고·출력은 회사별 워크스페이스에서 받는다.
+TEMPLATE_DIR = template_dir()
+CONFIG_DIR = config_dir()
+INPUT_DIR = PARSED_DIR = OUTPUT_DIR = REF_DIR = None  # main()에서 워크스페이스로 설정
 
 
 def _line(m=""):
@@ -169,8 +158,15 @@ def main():
     _line("=" * 56)
     _line("  A-0 현금및현금성자산 조서 생성 (총괄표 + 개별시트 · 단독 실행)")
     _line("=" * 56)
-    for d in (INPUT_DIR, PARSED_DIR, TEMPLATE_DIR, OUTPUT_DIR, REF_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+
+    global INPUT_DIR, PARSED_DIR, OUTPUT_DIR, REF_DIR
+    ws = select_workspace(line=_line)
+    if ws is None:
+        return 2
+    INPUT_DIR, PARSED_DIR, REF_DIR, OUTPUT_DIR = (
+        ws.input_dir, ws.parsed_dir, ws.ref_dir, ws.output_dir)
+    TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
+    _line(f"\n[회사] {ws.company}   (작업폴더: {ws.input_dir.parent})")
 
     settlement = _find("*정산표*.xls*")
     if not settlement:
@@ -187,30 +183,33 @@ def main():
     _line(f"[잔액원장] {Path(ledger).name if ledger else '없음 — 장기금융 잔액 매칭 생략'}")
 
     _line("\n[회사 정보 입력]")
-    company = _ask("회사명", example="주식회사 OO")
-    date = _ask("기준일", example="2025-12-31")
-    preparer = _ask("작성자(Preparer)", example="CJH")
-    reviewer = _ask("검토자(Reviewer)", required=False, example="KHK")
+    company = ws.company
+    date, preparer, reviewer = prompt_company_info(ws, input, _line)
 
-    out_dir = OUTPUT_DIR / company
-    _line("\n총괄표 생성 중...\n")
-    try:
-        build_lead_all(
-            settlement=settlement, registry=[_A0], config_dir=str(CONFIG_DIR),
-            template_root=str(TEMPLATE_DIR), output_dir=str(out_dir),
-            parsed_dir=str(PARSED_DIR / company),
-            params={"회사명": company, "날짜": date, "preparer": preparer, "reviewer": reviewer},
-        )
-    except PermissionError:
-        _line(f"\n[오류] 출력 파일이 열려 있습니다. 닫고 다시 실행해 주세요:\n  {out_dir}")
-        return 1
-    except Exception as e:
-        _line(f"\n[오류] 총괄표 생성 실패: {type(e).__name__}: {e}")
-        return 1
+    out_dir = ws.output_dir
     a0_path = str(out_dir / _A0["template"].replace("_template_", "_"))
-    if not os.path.exists(a0_path):
-        _line("\n[오류] 총괄표 산출물이 없습니다."); return 1
-    _line(f"[총괄표] {a0_path}\n개별시트 채우는 중...")
+    # 있으면 그대로 사용(조서생성 산출물 재사용), 없으면 정산표로 직접 생성.
+    if os.path.exists(a0_path):
+        _line(f"\n[총괄표] 기존 산출물 재사용: {Path(a0_path).name}")
+        _line("        (정산표가 바뀌었으면 '조서생성'을 다시 돌리거나 이 파일을 지우고 실행)")
+    else:
+        _line("\n총괄표가 없어 정산표로 생성 중...\n")
+        try:
+            build_lead_all(
+                settlement=settlement, registry=[_A0], config_dir=str(CONFIG_DIR),
+                template_root=str(TEMPLATE_DIR), output_dir=str(out_dir),
+                parsed_dir=str(ws.parsed_dir),
+                params={"회사명": company, "날짜": date, "preparer": preparer, "reviewer": reviewer},
+            )
+        except PermissionError:
+            _line(f"\n[오류] 출력 파일이 열려 있습니다. 닫고 다시 실행해 주세요:\n  {out_dir}")
+            return 1
+        except Exception as e:
+            _line(f"\n[오류] 총괄표 생성 실패: {type(e).__name__}: {e}")
+            return 1
+        if not os.path.exists(a0_path):
+            _line("\n[오류] 총괄표 산출물이 없습니다."); return 1
+    _line("개별시트 채우는 중...")
 
     tmp = str(out_dir / "_tmp_a0")
     Path(tmp).mkdir(parents=True, exist_ok=True)

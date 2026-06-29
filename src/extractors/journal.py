@@ -118,20 +118,49 @@ def _field_of_row_has_group(row):
 
 
 def parse_journal(path: str) -> list[dict]:
-    """분개장에서 거래라인을 추출. 시트/헤더 없으면 빈 리스트(예외 대신)."""
+    """분개장에서 거래라인을 추출. 시트/헤더 없으면 빈 리스트(예외 대신). .xls/.xlsx/.xlsm 지원."""
     p = Path(path)
-    if p.suffix.lower() == ".xls":
-        warnings.warn(f"[분개장] 구형 .xls는 미지원(.xlsx로 변환 필요): {p.name}")
+    ext = p.suffix.lower()
+    rows: list = []
+    if ext == ".xls":
+        try:
+            import xlrd
+        except ImportError:
+            warnings.warn(f"[분개장] .xls 처리에는 xlrd 필요: {p.name}")
+            return []
+        try:
+            wb = xlrd.open_workbook(str(p))
+        except Exception as e:
+            warnings.warn(f"[분개장] 로드 실패 {p.name}: {e}")
+            return []
+        names = wb.sheet_names()
+        # 시트 선택: '분개' 명 우선, 없으면 **가장 넓은(열)·큰 시트**(목차/요약 시트 회피).
+        sname = max(names, key=lambda nm: (1 if "분개" in nm else 0,
+                                           wb.sheet_by_name(nm).ncols, wb.sheet_by_name(nm).nrows))
+        sh = wb.sheet_by_name(sname)
+        dmode = wb.datemode
+
+        def _cv(cell):           # .xls 날짜 serial → ISO 문자열(헤더 인식·가독성), 그 외 원값
+            if cell.ctype == xlrd.XL_CELL_DATE:
+                try:
+                    return xlrd.xldate_as_datetime(cell.value, dmode).strftime("%Y-%m-%d")
+                except Exception:
+                    return cell.value
+            return cell.value
+        rows = [tuple(_cv(sh.cell(i, c)) for c in range(sh.ncols)) for i in range(sh.nrows)]
+    elif ext in (".xlsx", ".xlsm"):
+        try:
+            wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
+        except Exception as e:
+            warnings.warn(f"[분개장] 로드 실패 {p.name}: {e}")
+            return []
+        sheet = max(wb.sheetnames, key=lambda nm: (1 if "분개" in nm else 0,
+                                                   wb[nm].max_column or 0, wb[nm].max_row or 0))
+        rows = list(wb[sheet].iter_rows(values_only=True))
+        wb.close()
+    else:
+        warnings.warn(f"[분개장] 미지원 형식: {ext} ({p.name})")
         return []
-    try:
-        wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
-    except Exception as e:
-        warnings.warn(f"[분개장] 로드 실패 {p.name}: {e}")
-        return []
-    # 분개장 시트 선택: '분개장' 포함 시트 우선, 없으면 첫 시트
-    sheet = next((s for s in wb.sheetnames if "분개" in s), wb.sheetnames[0])
-    rows = list(wb[sheet].iter_rows(values_only=True))
-    wb.close()
     if not rows:
         return []
 
@@ -259,3 +288,25 @@ def _nearest_amt(row, acct_col, amt_cols):
         if v is not None:
             return v
     return None
+
+
+# ---------------------------------------------------------------------------
+# 이상적 분개장 양식 출력 (변환 EXE용 — 회계사 검수/하위단계 입력)
+# ---------------------------------------------------------------------------
+
+_IDEAL_JOURNAL_HEADER = ["날짜", "번호", "계정과목", "거래처", "적요", "차변", "대변"]
+
+
+def write_ideal_journal(rows: list, output_path: str, sheet_title: str = "분개장") -> str:
+    """parse_journal 결과(이상적 라인)를 단일 시트 표준 xlsx로 저장(변환 산출물)."""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_title
+    ws.append(_IDEAL_JOURNAL_HEADER)
+    keys = _IDEAL_JOURNAL_HEADER
+    for r in rows:
+        ws.append([r.get(k) for k in keys])
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output_path)
+    return output_path

@@ -143,40 +143,47 @@ def parse_insurance_holdings(confirm_xlsx):
     SYN = {"금융기관명": "거래처", "보험의 종류": "보험명", "보험의종류": "보험명", "증권번호": "증권번호",
            "부보기간_시작": "가입일", "부보기간_종료": "만기",
            "해약환급금_금액": "해약환급금_금액", "해약환급금": "해약환급금_disp"}
+    out = []
     try:
         wb = openpyxl.load_workbook(confirm_xlsx, read_only=True, data_only=True)
+        rows = (list(wb["INSURANCE"].iter_rows(values_only=True))
+                if "INSURANCE" in wb.sheetnames else [])
+        wb.close()
     except Exception:
-        return []
-    if "INSURANCE" not in wb.sheetnames:
-        wb.close(); return []
-    rows = list(wb["INSURANCE"].iter_rows(values_only=True)); wb.close()
-    b = find_section_bounds(rows, "1.")
-    if not b:
-        return []
-    si, se = b
-    hi = cm = None
-    for i in range(si + 1, min(si + 6, se)):
-        m = map_headers(rows[i], synonyms=SYN, required={"거래처", "보험명"})
-        if m and ("해약환급금_금액" in m or "해약환급금_disp" in m):
-            hi, cm = i, m; break
-    if not cm:
-        return []
-    out = []
-    for i in range(hi + 1, se):
-        r = rows[i]
+        rows = []
+    b = find_section_bounds(rows, "1.") if rows else None
+    if b:
+        si, se = b
+        hi = cm = None
+        for i in range(si + 1, min(si + 6, se)):
+            m = map_headers(rows[i], synonyms=SYN, required={"거래처", "보험명"})
+            if m and ("해약환급금_금액" in m or "해약환급금_disp" in m):
+                hi, cm = i, m; break
+        if cm:
+            for i in range(hi + 1, se):
+                r = rows[i]
 
-        def g(k):
-            idx = cm.get(k)
-            return r[idx] if idx is not None and idx < len(r) else None
+                def g(k):
+                    idx = cm.get(k)
+                    return r[idx] if idx is not None and idx < len(r) else None
 
-        def surr():
-            v = g("해약환급금_금액")
-            return v if v not in (None, "") else g("해약환급금_disp")
-        if not g("거래처") or _amt(surr()) <= 0:
-            continue
-        out.append({"거래처": str(g("거래처")).strip(), "보험명": str(g("보험명") or "").strip(),
-                    "증권번호": str(g("증권번호") or "").strip(), "가입일": _fmt_date(g("가입일")),
-                    "만기": _fmt_date(g("만기")), "잔액": int(_amt(surr()))})
+                def surr():
+                    v = g("해약환급금_금액")
+                    return v if v not in (None, "") else g("해약환급금_disp")
+                if not g("거래처") or _amt(surr()) <= 0:
+                    continue
+                out.append({"거래처": str(g("거래처")).strip(), "보험명": str(g("보험명") or "").strip(),
+                            "증권번호": str(g("증권번호") or "").strip(), "가입일": _fmt_date(g("가입일")),
+                            "만기": _fmt_date(g("만기")), "잔액": int(_amt(surr()))})
+    # 기타 시트(GUARANTEE 등)의 해약환급금도 장기금융 보험가입현황에 포함(위치 불문 스캔)
+    try:
+        from extractors.surrender import parse_surrender_value
+        for s in parse_surrender_value(confirm_xlsx, exclude_sheets=("INSURANCE",)):
+            out.append({"거래처": s["금융기관명"], "보험명": s["보험의종류"],
+                        "증권번호": s["증권번호"], "가입일": "", "만기": "",
+                        "잔액": int(s["해약환급금"])})
+    except Exception:
+        pass
     return out
 
 
@@ -228,10 +235,10 @@ def build_longterm_recon(confirm_xlsx, ledger_path):
     Returns: [{거래처, 잔액, 해약환급금, 조서번호}] (차액=잔액-해약환급금은 시트에서 수식).
     """
     from collections import defaultdict
-    from extractors.insurance import parse_insurance
+    from extractors.surrender import parse_longterm_groups
     from extractors.ledger import parse_ledger
     try:
-        ins = parse_insurance(confirm_xlsx)
+        ins = parse_longterm_groups(confirm_xlsx)   # INSURANCE + 해약환급금(기타시트) 합산
     except Exception:
         ins = []
     by = {}

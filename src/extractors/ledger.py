@@ -151,6 +151,22 @@ def _is_total(row: list, c_code: int, c_name: int) -> bool:
     return False
 
 
+# 페이지 분할로 시트 중간에 헤더가 반복 출력되는 ERP가 있다(거 래 처 명·잔 액 등).
+# 그 행이 데이터로 섞이면 잔액='잔액' 같은 텍스트가 들어가 후속 수치처리가 깨진다 → 가드로 제거.
+_HDR_NAME_TOKENS = {"거래처명", "거래처", "상호", "계좌명", "예금주", "거래처코드"}
+_HDR_BAL_TOKENS = {"잔액", "기말", "기말잔액"}
+
+
+def _is_header_repeat(row: list, col_map: dict[str, int]) -> bool:
+    """반복 출력된 헤더 행인지(거래처명/잔액 셀이 헤더 라벨) — 데이터로 오인 방지. 전 파서 공용."""
+    ni, bi = col_map.get("거래처명"), col_map.get("잔액")
+    if ni is not None and ni < len(row) and _normalize(row[ni]) in _HDR_NAME_TOKENS:
+        return True
+    if bi is not None and bi < len(row) and _normalize(row[bi]) in _HDR_BAL_TOKENS:
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 행 → 표준 dict  (계정과목은 인자로 받은 시트명 기반 값을 그대로 사용)
 # ---------------------------------------------------------------------------
@@ -207,6 +223,8 @@ def _parse_sheet(get_row, nrows: int, account: str, sheet_name: str) -> list[dic
             continue
         if _is_total(row, c_code, c_name):
             continue
+        if _is_header_repeat(row, col_map):       # 페이지 분할 반복 헤더 제거
+            continue
         # 거래처명·코드 모두 비어있으면 데이터 행 아님
         code = row[c_code] if c_code < len(row) else None
         name = row[c_name] if c_name < len(row) else None
@@ -247,10 +265,66 @@ def _parse_account_col(sheets: list) -> list[dict]:
                 continue
             if _is_total(row, c_code, c_name):
                 continue
+            if _is_header_repeat(row, col_map):       # 페이지 분할 반복 헤더 제거
+                continue
             acct = row[c_acct] if c_acct < len(row) else None
             if acct is None or str(acct).strip() == "":   # 계정과목 없는 행=소계/공백
                 continue
             out.append(_to_record(row, str(acct).strip(), col_map))
+    return out
+
+
+# 거래처 헤더 행: "… 거래처 : [코드] 거래처명" (회사명 토큰이 앞에 와도 마지막 '거래처:'를 잡음)
+_RE_PARTY_HEADER = re.compile(r"거래처\s*[:：]\s*(.+)$")
+_RE_PARTY_CODE = re.compile(r"^\[[^\]]*\]\s*")
+
+
+def _parse_party_block(sheets: list) -> list[dict]:
+    """거래처별 블록 형식(단일 시트) 폴백 파싱.
+
+    레이아웃: 거래처마다 '… 거래처 : [코드] 거래처명' 헤더 → '코드|계정과목명|전기이월|차변|대변|잔액'
+    컬럼헤더 → 계정과목 행들 → '[합계]'. 즉 **거래처가 블록 헤더에, 계정과목이 행**으로 있는 transpose
+    구조라 account_col(거래처명이 컬럼이어야 함)로는 안 잡힌다. 거래처명을 블록 헤더에서 끌어와 각 계정
+    행에 부여한다. ERP 기계출력이라 컬럼·블록헤더 신뢰 가능(시트명-only 규칙의 정당한 예외).
+
+    sheets: [(시트명, get_row, nrows), ...]. Returns: account_col과 동일 record 리스트.
+    """
+    out: list[dict] = []
+    req = {"계정과목", "잔액"}            # 거래처명은 컬럼에 없음 → 블록 헤더에서 채움
+    for name, get_row, nrows in sheets:
+        cur_party = None
+        col_map = None
+        for r in range(nrows):
+            row = get_row(r)
+            cells = ["" if v is None else str(v) for v in row]
+            # ① 거래처 헤더?
+            m = _RE_PARTY_HEADER.search(" ".join(cells))
+            if m:
+                party = _RE_PARTY_CODE.sub("", m.group(1).strip()).strip()
+                cur_party = party or cur_party
+                col_map = None                # 새 블록 → 컬럼헤더 재탐색
+                continue
+            # ② 컬럼 헤더?
+            cm = map_headers(row, synonyms=_SYNONYMS_ACCT, required=req,
+                             sub_keywords=_SUB_KEYWORDS_ACCT, parser_key="ledger")
+            if cm is not None and "계정과목" in cm:
+                col_map = cm
+                continue
+            # ③ 데이터 행
+            if not (col_map and cur_party):
+                continue
+            if any(_normalize(c) in _TOTAL_MARKERS or _normalize(c).startswith("합")
+                   for c in cells):
+                continue                      # '[ 합 계 ]' 등 소계행
+            if _is_header_repeat(row, col_map):       # 페이지 분할 반복 헤더 제거
+                continue
+            ci = col_map["계정과목"]
+            acct = row[ci] if ci < len(row) else None
+            if acct is None or str(acct).strip() == "":
+                continue
+            rec = _to_record(row, str(acct).strip(), col_map)
+            rec["거래처명"] = cur_party       # 컬럼에 없으므로 블록 헤더 값으로 덮어씀
+            out.append(rec)
     return out
 
 
@@ -341,9 +415,10 @@ def parse_ledger(path: str) -> list[dict]:
                 continue  # 형식 패턴에 맞지 않는 시트(표지·요약 등) 건너뜀
             rows.extend(_parse_sheet(get_row, nrows, account, name))
     else:
-        rows = _parse_account_col(sheets)   # 단일/통합 시트(계정과목이 행 컬럼)
+        # 단일/통합 시트: ① 계정과목이 행 컬럼(account_col) → ② 거래처별 블록(party_block) 순 폴백.
+        rows = _parse_account_col(sheets) or _parse_party_block(sheets)
         if not rows:
-            raise ValueError(f"[거래처잔액 파서] 시트명 형식·계정과목 컬럼 모두 미인식: {names[:5]}")
+            raise ValueError(f"[거래처잔액 파서] 시트명 형식·계정과목 컬럼·거래처블록 모두 미인식: {names[:5]}")
 
     _validate_result(rows, str(p))
     return rows

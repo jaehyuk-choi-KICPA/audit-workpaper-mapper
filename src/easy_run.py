@@ -30,25 +30,11 @@ import openpyxl
 
 from run_a1 import discover_inputs
 from pipeline import build_a1
+from workspace import select_workspace, template_dir, config_dir, prompt_company_info
 
-def _base_dir() -> Path:
-    """프로그램 루트. .exe(frozen)면 실행파일 폴더, 스크립트면 프로젝트 루트."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE = _base_dir()
-
-# 사용자-대면 5폴더 = 배포 루트 최상위. 환경변수(A1_*_DIR)로 재정의 가능.
-INPUT_DIR    = Path(os.environ.get("A1_INPUT_DIR",    BASE / "입력자료"))
-PARSED_DIR   = Path(os.environ.get("A1_PARSED_DIR",   BASE / "변환자료"))
-TEMPLATE_DIR = Path(os.environ.get("A1_TEMPLATE_DIR", BASE / "양식자료"))
-REF_DIR      = Path(os.environ.get("A1_REF_DIR",      BASE / "참고자료"))
-OUTPUT_DIR   = Path(os.environ.get("A1_OUTPUT_DIR",   BASE / "출력조서"))
-
-# config(셀 매핑) = 프로그램 내부 자산. 스크립트=_internal/config, .exe=내장(_MEIPASS).
-CONFIG_DIR = Path(getattr(sys, "_MEIPASS", str(BASE))) / "_internal" / "config"
+# 양식·config = 회사 무관 공유 자산. 입력·변환·참고·출력은 회사별 워크스페이스에서 받는다.
+TEMPLATE_DIR = template_dir()
+CONFIG_DIR = config_dir()
 
 # A-1 양식이 가져야 할 시트(이 시트들이 있으면 A-1 템플릿으로 인식 — 파일명 무관)
 _A1_SHEET_MARKERS = ("A100_금융기관 조회서 완전성체크",
@@ -90,8 +76,14 @@ def main():
     _line("  A-1 (은행·금융기관 조회) 조서 자동 생성")
     _line("=" * 56)
 
-    for d in (INPUT_DIR, PARSED_DIR, TEMPLATE_DIR, REF_DIR, OUTPUT_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+    # 0) 회사 워크스페이스 선택(작업/{회사}/ — 입력·변환·참고·출력 회사별 격리)
+    ws = select_workspace(line=_line)
+    if ws is None:
+        return 2
+    INPUT_DIR, PARSED_DIR, REF_DIR, OUTPUT_DIR = (
+        ws.input_dir, ws.parsed_dir, ws.ref_dir, ws.output_dir)
+    TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
+    _line(f"\n[회사] {ws.company}   (작업폴더: {INPUT_DIR.parent})")
 
     # 1) 입력 파일 자동 탐색
     found = discover_inputs(str(INPUT_DIR))
@@ -131,14 +123,12 @@ def main():
         return 2
     _line(f"\n[양식] {Path(template).name}")
 
-    # 2) 회사 정보 입력
+    # 2) 회사 정보 입력 (회사명은 워크스페이스에서 자동)
     _line("\n[회사 정보 입력]")
-    company = _ask("회사명", example="주식회사 OO")
-    date = _ask("기준일", example="2025-12-31")
-    preparer = _ask("작성자(Preparer)", example="CJH")
-    reviewer = _ask("검토자(Reviewer)", required=False, example="KHK")
+    company = ws.company
+    date, preparer, reviewer = prompt_company_info(ws, input, _line)
 
-    output = OUTPUT_DIR / f"{company}_A-1.xlsx"
+    output = OUTPUT_DIR / "A-1.xlsx"
 
     # 3) 생성
     _line("\n생성 중...")
@@ -160,7 +150,7 @@ def main():
 
     # 진단 리포트: 화면 출력 + 파일 저장(엑셀을 못 보는 사용자가 무엇이 문제인지 알도록)
     _line("\n" + report.render())
-    report_path = OUTPUT_DIR / f"{company}_실행리포트.txt"
+    report_path = OUTPUT_DIR / "A-1_실행리포트.txt"
     try:
         report_path.write_text(report.render(), encoding="utf-8")
     except Exception:

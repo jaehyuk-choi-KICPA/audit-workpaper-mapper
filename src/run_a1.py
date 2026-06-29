@@ -46,12 +46,16 @@ def discover_inputs(data_dir: str) -> dict:
       필수자료3_ = 잔액 소스(_유형1 거래처잔액현황 · _유형2 결산보고서) /
       보조자료_A1 = 개별 잔액명세서(현금성 등, A-1 보강용·선택)
     """
-    # 표준 파일명(설명서 안내)으로 역할을 인식한다. 토큰으로 시작만 하면 뒤는 자유.
-    #   필수자료1_=발송CS / 필수자료2_=조회서 / 필수자료3_=잔액(_유형1·_유형2) / 보조자료_A1=개별명세서
-    control = _find_one(data_dir, ["필수자료1*"], exclude=("필수자료2", "필수자료3", "보조자료"))
-    confirm = _find_one(data_dir, ["필수자료2*"], exclude=("필수자료1", "필수자료3", "보조자료"))
-    ledger  = _find_one(data_dir, ["필수자료3*"], exclude=("보조자료",))
-    aux_a1  = _find_one(data_dir, ["보조자료_A1*"])
+    # 단순 역할명(권장)을 1차로 인식하고, 기존 필수자료N 토큰도 계속 받는다(무회귀, 추가식).
+    #   발송CS / 조회서 / 잔액(거래처원장·결산보고서) / 개별명세_A1(보조·선택)
+    #   ↔ 레거시: 필수자료1_=발송CS · 필수자료2_=조회서 · 필수자료3_=잔액 · 보조자료_A1
+    control = _find_one(data_dir, ["발송CS*", "*발송CS*", "필수자료1*"],
+                        exclude=("필수자료2", "필수자료3", "보조자료", "조회서", "잔액"))
+    confirm = _find_one(data_dir, ["조회서*", "*조회서*", "필수자료2*"],
+                        exclude=("필수자료1", "필수자료3", "보조자료", "발송CS"))
+    ledger  = _find_one(data_dir, ["잔액*", "*잔액*", "*거래처원장*", "*결산보고서*", "필수자료3*"],
+                        exclude=("보조자료",))
+    aux_a1  = _find_one(data_dir, ["개별명세_A1*", "개별명세*", "보조자료_A1*"])
     return {"control_sheet": control, "confirm_xlsx": confirm,
             "ledger_src": ledger, "aux_a1": aux_a1}
 
