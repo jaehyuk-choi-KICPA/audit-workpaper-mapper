@@ -112,13 +112,20 @@ def load_with_cache(path: str, parse_fn: Callable, *,
     return result
 
 
+# 거래처원장 파서 버전. 파서(extractors/ledger.py)를 개선하면 올린다 →
+# 소스가 안 바뀌어도 옛 캐시(다른 버전)는 무시·정리되고 새 파서로 재변환된다.
+# (소스 해시만으로는 '파서 개선'이 캐시에 반영 안 돼, 거래처블록 등 새 형식이 stale
+#  빈 캐시에 가려지는 사고가 있었음 → 버전 키로 원천 차단.)
+_IDEAL_LEDGER_VER = "v2"
+
+
 def cached_ideal_ledger(source_path: str, parsed_dir: str, config_dir: str) -> list[dict]:
     """잔액 소스(거래처원장/결산보고서)를 이상적 양식으로 변환하되,
-    소스 파일 해시로 캐시된 결과를 재사용한다.
+    소스 파일 해시 + 파서 버전으로 캐시된 결과를 재사용한다.
 
-    `변환자료/{원본명}__ideal_{hash}.xlsx` 가 있으면 재파싱 없이 그대로 읽는다.
-    원본이 바뀌면 해시가 달라져 자동 재변환된다. 여러 조서 생성기가 이 함수를
-    호출하면 **동일 변환 스냅샷을 공유**하므로 일관성·속도가 확보된다.
+    `변환자료/{원본명}__ideal_{ver}_{hash}.xlsx` 가 있으면 재파싱 없이 그대로 읽는다.
+    원본이 바뀌면 해시가, 파서가 개선되면 버전이 달라져 자동 재변환된다. 여러 조서
+    생성기가 이 함수를 호출하면 **동일 변환 스냅샷을 공유**하므로 일관성·속도가 확보된다.
 
     Args:
         source_path: 원본 엑셀 (거래처원장 .xls/.xlsx 또는 결산보고서 .xlsx)
@@ -137,9 +144,10 @@ def cached_ideal_ledger(source_path: str, parsed_dir: str, config_dir: str) -> l
     src = Path(source_path)
     out_dir = Path(parsed_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cached = out_dir / f"{src.stem}__ideal_{file_hash(source_path)}.xlsx"
+    cached = out_dir / f"{src.stem}__ideal_{_IDEAL_LEDGER_VER}_{file_hash(source_path)}.xlsx"
 
-    # 소스가 바뀌면 옛 해시 변환물(.xlsx)이 남아 누적 → 현재 것만 두고 정리.
+    # 소스가 바뀌거나 파서 버전이 오르면 옛 변환물(.xlsx)이 남아 누적 → 현재 것만 두고 정리.
+    # (옛 버전 무버전 이름 `__ideal_{hash}.xlsx`도 이 글롭에 걸려 함께 제거됨)
     for old in out_dir.glob(f"{src.stem}__ideal_*.xlsx"):
         if old.name != cached.name:
             try:
